@@ -1,3 +1,4 @@
+use crate::privacy::{bound_chars, redact_text};
 use crate::types::SessionSummary;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Duration, Utc};
@@ -132,9 +133,9 @@ fn parse_session(path: &Path) -> Result<SessionSummary> {
                     "user" => {
                         user_turns += 1;
                         if let Some(text) = extract_text(v.pointer("/message/content")) {
-                            let cleaned = redact(&text);
+                            let cleaned = redact_text(&text);
                             if is_useful_user_text(&cleaned) && user_excerpts.len() < 12 {
-                                user_excerpts.push(truncate(&cleaned, 500));
+                                user_excerpts.push(bound_chars(&cleaned, 500));
                             }
                         }
                     }
@@ -247,34 +248,6 @@ fn is_useful_user_text(s: &str) -> bool {
     true
 }
 
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let t: String = s.chars().take(max).collect();
-        format!("{t}…")
-    }
-}
-
-fn redact(s: &str) -> String {
-    // best-effort secret-shaped redaction
-    let patterns = [
-        (
-            r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+",
-            "$1=[REDACTED]",
-        ),
-        (r"sk-[A-Za-z0-9]{10,}", "sk-[REDACTED]"),
-        (r"ghp_[A-Za-z0-9]{20,}", "ghp_[REDACTED]"),
-        (r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[EMAIL]"),
-    ];
-    let mut out = s.to_string();
-    for (pat, rep) in patterns {
-        if let Ok(re) = Regex::new(pat) {
-            out = re.replace_all(&out, rep).to_string();
-        }
-    }
-    out
-}
 
 #[cfg(test)]
 mod tests {
@@ -311,7 +284,7 @@ mod tests {
 
     #[test]
     fn redacts_lowercase_email_addresses() {
-        let redacted = redact("Contact owner@example.com before replay");
+        let redacted = redact_text("Contact owner@example.com before replay");
         assert_eq!(redacted, "Contact [EMAIL] before replay");
     }
 }
