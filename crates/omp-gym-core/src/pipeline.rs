@@ -1,12 +1,11 @@
 use crate::config::GymConfig;
 use crate::harvest::harvest_sessions;
 use crate::mine::mine_tasks;
-use crate::paths::ensure_private_dir;
+use crate::paths::{atomic_write_json, ensure_private_dir};
 use crate::state::{load_latest_proposal, load_state, save_state};
 use crate::types::{TasksFile, SCHEMA_VERSION};
 use anyhow::{bail, Result};
 use chrono::Utc;
-use std::fs;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -31,14 +30,15 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
         cfg.max_sessions,
     )?;
     let tasks = mine_tasks(&sessions, cfg.max_tasks);
+    let task_count = tasks.len();
 
     let tasks_file = TasksFile {
         schema_version: SCHEMA_VERSION,
         generated_at: Utc::now(),
         project: cfg.project.clone(),
-        tasks: tasks.clone(),
+        tasks,
     };
-    fs::write(cfg.tasks_path(), serde_json::to_string_pretty(&tasks_file)?)?;
+    atomic_write_json(&cfg.tasks_path(), &tasks_file)?;
 
     let mut state = load_state(&cfg.state_path())?;
     state.last_harvest_at = Some(Utc::now());
@@ -53,7 +53,7 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
         ),
         format!(
             "Mined {} task(s) → {}",
-            tasks.len(),
+            task_count,
             cfg.tasks_path().display()
         ),
         "No skill files were modified.".into(),
@@ -73,7 +73,7 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
 
     Ok(GymReport {
         sessions: sessions.len(),
-        tasks: tasks.len(),
+        tasks: task_count,
         backend: cfg.backend.clone(),
         staged: false,
         proposal_id: None,
@@ -285,6 +285,25 @@ mod tests {
         let ignore = std::fs::read_to_string(config.gym_dir().join(".gitignore"))
             .expect("gym artifacts should be ignored");
         assert_eq!(ignore, "*\n!.gitignore\n");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for (path, expected_mode) in [
+                (config.gym_dir(), 0o700),
+                (config.gym_dir().join(".gitignore"), 0o600),
+                (config.tasks_path(), 0o600),
+                (config.state_path(), 0o600),
+            ] {
+                let mode = std::fs::metadata(&path)
+                    .expect("private artifact metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, expected_mode, "unexpected mode for {}", path.display());
+            }
+        }
 
         std::fs::remove_dir_all(root).ok();
     }

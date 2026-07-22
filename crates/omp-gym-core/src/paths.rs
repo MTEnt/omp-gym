@@ -5,6 +5,8 @@ use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
 /// Default OMP agent home: ~/.omp/agent
 pub fn omp_agent_home() -> Result<PathBuf> {
@@ -75,9 +77,11 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     };
 
     let result = (|| -> Result<()> {
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let mut file = options
             .open(&temp_path)
             .with_context(|| format!("create temporary file {}", temp_path.display()))?;
         if let Some(permissions) = permissions {
@@ -132,6 +136,9 @@ pub fn load_json<T: DeserializeOwned>(path: &Path, description: &str) -> Result<
 
 pub fn ensure_private_dir(path: &Path) -> Result<()> {
     ensure_dir(path)?;
+    #[cfg(unix)]
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+        .with_context(|| format!("set private directory permissions {}", path.display()))?;
     let ignore = path.join(".gitignore");
     if !ignore.exists() {
         atomic_write(&ignore, b"*\n!.gitignore\n")?;
@@ -179,6 +186,87 @@ mod tests {
                 .expect("serialize expected document")
         );
         assert_eq!(entry_names(root.path()), vec!["state.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ensure_private_dir_sets_new_directory_mode_to_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("create temporary directory");
+        let path = root.path().join(".omp").join("gym");
+
+        ensure_private_dir(&path).expect("create private directory");
+
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("private directory metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_creates_new_artifact_mode_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempdir().expect("create temporary directory");
+        let path = root.path().join("artifact.json");
+
+        atomic_write_json(&path, &serde_json::json!({"private": true}))
+            .expect("write private artifact");
+
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("artifact metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+    }
+
+    #[test]
+    fn atomic_write_never_exposes_partial_replacements() {
+        use std::sync::{Arc, Barrier};
+        use std::thread;
+
+        let root = tempdir().expect("create temporary directory");
+        let path = root.path().join("artifact.bin");
+        let old: Arc<[u8]> = vec![b'A'; 256 * 1024].into();
+        let new: Arc<[u8]> = vec![b'B'; 384 * 1024].into();
+        atomic_write(&path, old.as_ref()).expect("write initial artifact");
+
+        let writer_path = path.clone();
+        let writer_old = Arc::clone(&old);
+        let writer_new = Arc::clone(&new);
+        let start = Arc::new(Barrier::new(2));
+        let writer_start = Arc::clone(&start);
+        let writer = thread::spawn(move || {
+            writer_start.wait();
+            for iteration in 0..64 {
+                let bytes = if iteration % 2 == 0 {
+                    writer_new.as_ref()
+                } else {
+                    writer_old.as_ref()
+                };
+                atomic_write(&writer_path, bytes).expect("replace artifact atomically");
+            }
+        });
+
+        start.wait();
+        for _ in 0..256 {
+            let observed = std::fs::read(&path).expect("read visible artifact");
+            assert!(
+                observed.as_slice() == old.as_ref() || observed.as_slice() == new.as_ref(),
+                "reader observed a partial or combined artifact of {} bytes",
+                observed.len()
+            );
+        }
+        writer.join().expect("writer thread");
     }
 
     #[cfg(unix)]
