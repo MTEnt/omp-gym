@@ -206,6 +206,16 @@ pub fn gate(baseline: &[TaskScore], candidate: &[TaskScore], min_delta: f64) -> 
     if baseline_by_id.keys().ne(candidate_by_id.keys()) {
         reasons.push("baseline and candidate task ID sets differ".to_owned());
     }
+    for (task_id, score) in &baseline_by_id {
+        if !score.invariants_passed {
+            reasons.push(format!("baseline task {task_id} invariants failed"));
+        }
+    }
+    for (task_id, score) in &candidate_by_id {
+        if !score.invariants_passed {
+            reasons.push(format!("candidate task {task_id} invariants failed"));
+        }
+    }
 
     let mut improved_checks = 0;
     for (task_id, baseline_score) in &baseline_by_id {
@@ -720,6 +730,35 @@ mod tests {
         assert!(!check_regression.accepted);
         assert_eq!(check_regression.improved_checks, 1);
         assert!(check_regression.regressions.iter().any(|reason| reason.contains("check 0 regressed")));
+    }
+
+    #[test]
+    fn gate_requires_successful_baseline_and_candidate_replays() {
+        let check = CheckSpec::Exact { value: "ok".into() };
+        let baseline = vec![
+            task_score("recovered", 0.0, false, vec![result(check.clone(), false)]),
+            task_score("still-failed", 0.0, false, vec![result(check.clone(), false)]),
+            task_score("improved", 0.0, true, vec![result(check.clone(), false)]),
+        ];
+        let candidate = vec![
+            task_score("recovered", 1.0, true, vec![result(check.clone(), true)]),
+            task_score("still-failed", 0.0, false, vec![result(check.clone(), false)]),
+            task_score("improved", 1.0, true, vec![result(check, true)]),
+        ];
+
+        let decision = gate(&baseline, &candidate, 0.5);
+        assert!(!decision.accepted, "{decision:?}");
+        assert!(decision
+            .reasons
+            .contains(&"baseline task recovered invariants failed".to_owned()));
+        assert!(decision
+            .reasons
+            .contains(&"baseline task still-failed invariants failed".to_owned()));
+        assert!(decision
+            .reasons
+            .contains(&"candidate task still-failed invariants failed".to_owned()));
+        assert!((decision.delta - 2.0 / 3.0).abs() <= f64::EPSILON);
+        assert_eq!(decision.improved_checks, 2);
     }
 
     #[test]
