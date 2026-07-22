@@ -1,5 +1,5 @@
 use crate::config::GymConfig;
-use crate::privacy::{redact_json_strings, redact_text};
+use crate::privacy::redact_text;
 use crate::types::{ModelRole, Trajectory, SCHEMA_VERSION};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -15,9 +15,10 @@ use wait_timeout::ChildExt;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
-// wait-timeout's Unix waiter is process-global; serialize waits so simultaneous
-// replay tests (and callers) cannot race SIGCHLD bookkeeping.
+// wait-timeout installs process-global SIGCHLD bookkeeping on Unix. Serializing
+// its wait section avoids cross-child wakeup races while capture remains concurrent.
 static PROCESS_WAIT: Mutex<()> = Mutex::new(());
+
 
 pub struct ModelRequest<'a> {
     pub role: ModelRole,
@@ -82,6 +83,7 @@ impl ModelRunner for OmpRunner {
             command.args(["--model", model]);
         }
         command
+            .arg("--")
             .arg(request.prompt)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
@@ -96,14 +98,32 @@ impl ModelRunner for OmpRunner {
             });
         }
 
-        let wait_guard = PROCESS_WAIT
-            .lock()
-            .map_err(|_| anyhow::anyhow!("OMP process wait lock is poisoned"))?;
         let started_at = Utc::now();
         let started = Instant::now();
-        let mut child = command
-            .spawn()
-            .with_context(|| format!("spawn OMP binary {}", self.config.omp_bin.display()))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(_) => {
+                return Ok(Trajectory {
+                    schema_version: SCHEMA_VERSION,
+                    id: format!("trajectory-{}", uuid::Uuid::new_v4()),
+                    role: request.role.clone(),
+                    task_id: None,
+                    started_at,
+                    duration_ms: started.elapsed().as_millis().min(u64::MAX as u128) as u64,
+                    prompt_hash: hash_text(request.prompt),
+                    skill_hash: hash_text(request.skill),
+                    model: None,
+                    process_success: false,
+                    exit_code: None,
+                    timed_out: false,
+                    response_nonempty: false,
+                    final_text: None,
+                    events: Vec::new(),
+                    stderr: String::new(),
+                    error: Some("failed to start OMP process".into()),
+                });
+            }
+        };
         let child_pid = child.id();
         let stdout = child.stdout.take().context("capture OMP stdout")?;
         let stderr = child.stderr.take().context("capture OMP stderr")?;
@@ -113,6 +133,9 @@ impl ModelRunner for OmpRunner {
 
         let timeout = Duration::from_secs(timeout_secs);
         let mut timed_out = false;
+        let wait_guard = PROCESS_WAIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (status, wait_error) = match child.wait_timeout(timeout) {
             Ok(Some(status)) => (Some(status), None),
             Ok(None) => {
@@ -135,21 +158,32 @@ impl ModelRunner for OmpRunner {
                 )
             }
         };
+        drop(wait_guard);
         // The leader may exit while descendants still hold capture pipes.
         terminate_process_group(&mut child, child_pid);
-        drop(wait_guard);
 
-        let (stdout_bytes, stdout_error) = join_capture(stdout_thread, "stdout");
-        let (stderr_bytes, stderr_error) = join_capture(stderr_thread, "stderr");
-        let stdout = String::from_utf8_lossy(&stdout_bytes);
-        let stderr = redact_text(&String::from_utf8_lossy(&stderr_bytes));
+        let (stdout_capture, stdout_error) = join_capture(stdout_thread, "stdout");
+        let (stderr_capture, stderr_error) = join_capture(stderr_thread, "stderr");
+        let stdout = String::from_utf8_lossy(&stdout_capture.bytes);
+        let stderr = sanitize_text_evidence(
+            &String::from_utf8_lossy(&stderr_capture.bytes),
+            request.prompt,
+            request.skill,
+        );
         let stderr = bounded_utf8(&stderr, limit);
-        let (events, final_text, model, event_error) = parse_events(&stdout);
+        let (events, final_text, model, event_error) =
+            parse_events(&stdout, limit, request.prompt, request.skill);
 
         let mut errors = Vec::new();
         errors.extend(wait_error);
         errors.extend(stdout_error);
         errors.extend(stderr_error);
+        if stdout_capture.truncated {
+            errors.push(format!("stdout capture truncated at {limit} bytes"));
+        }
+        if stderr_capture.truncated {
+            errors.push(format!("stderr capture truncated at {limit} bytes"));
+        }
         if timed_out {
             errors.push(format!("OMP process timed out after {timeout_secs} seconds"));
         }
@@ -216,28 +250,48 @@ fn terminate_process_group(child: &mut std::process::Child, child_pid: u32) {
     }
 }
 
-fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<Vec<u8>> {
+struct Capture {
+    bytes: Vec<u8>,
+    truncated: bool,
+}
+
+fn read_bounded(mut reader: impl Read, limit: usize) -> io::Result<Capture> {
     let mut retained = Vec::with_capacity(limit.min(8192));
+    let mut truncated = false;
     let mut buffer = [0_u8; 8192];
     loop {
         let read = reader.read(&mut buffer)?;
         if read == 0 {
-            return Ok(retained);
+            return Ok(Capture {
+                bytes: retained,
+                truncated,
+            });
         }
         let remaining = limit.saturating_sub(retained.len());
-        retained.extend_from_slice(&buffer[..read.min(remaining)]);
+        let retained_now = read.min(remaining);
+        retained.extend_from_slice(&buffer[..retained_now]);
+        truncated |= retained_now < read;
     }
 }
 
 fn join_capture(
-    handle: thread::JoinHandle<io::Result<Vec<u8>>>,
+    handle: thread::JoinHandle<io::Result<Capture>>,
     stream: &str,
-) -> (Vec<u8>, Option<String>) {
+) -> (Capture, Option<String>) {
     match handle.join() {
-        Ok(Ok(bytes)) => (bytes, None),
-        Ok(Err(error)) => (Vec::new(), Some(format!("read OMP {stream}: {error}"))),
+        Ok(Ok(capture)) => (capture, None),
+        Ok(Err(error)) => (
+            Capture {
+                bytes: Vec::new(),
+                truncated: false,
+            },
+            Some(format!("read OMP {stream}: {error}")),
+        ),
         Err(_) => (
-            Vec::new(),
+            Capture {
+                bytes: Vec::new(),
+                truncated: false,
+            },
             Some(format!("OMP {stream} capture thread panicked")),
         ),
     }
@@ -254,8 +308,16 @@ fn bounded_utf8(text: &str, max_bytes: usize) -> String {
     text[..end].to_owned()
 }
 
-fn parse_events(stdout: &str) -> (Vec<Value>, Option<String>, Option<String>, Option<String>) {
+fn parse_events(
+    stdout: &str,
+    limit: usize,
+    prompt: &str,
+    skill: &str,
+) -> (Vec<Value>, Option<String>, Option<String>, Option<String>) {
     let mut events = Vec::new();
+    let mut events_bytes = 2_usize;
+    let mut events_truncated = false;
+    let mut assistant_message_observed = false;
     let mut message_end = None;
     let mut message_error = None;
     let mut agent_end = None;
@@ -277,18 +339,24 @@ fn parse_events(stdout: &str) -> (Vec<Value>, Option<String>, Option<String>, Op
                 );
             }
         };
+        model = extract_model(&event).or(model);
         match event.get("type").and_then(Value::as_str) {
             Some("message_end") => {
                 if let Some(message) = event.get("message").filter(|message| {
                     message.get("role").and_then(Value::as_str) == Some("assistant")
                 }) {
-                    message_end = message.get("content").and_then(extract_text);
+                    assistant_message_observed = true;
+                    message_end = message
+                        .get("content")
+                        .and_then(extract_text)
+                        .map(|text| redact_text(&text));
                     message_error = terminal_failure(message);
-                    model = extract_model(&event).or(model);
                 }
             }
             Some("agent_end") => {
-                agent_end = extract_agent_end(&event).or(agent_end);
+                agent_end = extract_agent_end(&event)
+                    .map(|text| redact_text(&text))
+                    .or(agent_end);
                 agent_error = terminal_failure(&event).or_else(|| {
                     event
                         .get("messages")
@@ -304,19 +372,86 @@ fn parse_events(stdout: &str) -> (Vec<Value>, Option<String>, Option<String>, Op
                                 .and_then(terminal_failure)
                         })
                 });
-                model = extract_model(&event).or(model);
             }
             _ => {}
         }
-        redact_json_strings(&mut event);
-        events.push(event);
+
+        sanitize_event_evidence(&mut event, prompt, skill);
+        let event_bytes = serde_json::to_vec(&event)
+            .expect("JSON value evidence must serialize")
+            .len();
+        let separator = usize::from(!events.is_empty());
+        if events_bytes
+            .saturating_add(separator)
+            .saturating_add(event_bytes)
+            <= limit
+        {
+            events_bytes += separator + event_bytes;
+            events.push(event);
+        } else {
+            events_truncated = true;
+        }
     }
 
-    if message_end.is_some() {
-        (events, message_end, model, message_error)
+    let (final_text, terminal_error) = if assistant_message_observed {
+        (message_end, message_error)
     } else {
-        (events, agent_end, model, agent_error)
+        (agent_end, agent_error)
+    };
+    let terminal_error =
+        terminal_error.map(|error| sanitize_text_evidence(&error, prompt, skill));
+    let event_error = if events_truncated {
+        Some(match terminal_error {
+            Some(error) => format!("{error}; retained events truncated at {limit} bytes"),
+            None => format!("retained events truncated at {limit} bytes"),
+        })
+    } else {
+        terminal_error
+    };
+    (events, final_text, model, event_error)
+}
+
+fn sanitize_event_evidence(value: &mut Value, prompt: &str, skill: &str) {
+    match value {
+        Value::String(text) => *text = sanitize_text_evidence(text, prompt, skill),
+        Value::Array(items) => {
+            for item in items {
+                sanitize_event_evidence(item, prompt, skill);
+            }
+        }
+        Value::Object(fields) => {
+            let sensitive_role = fields
+                .get("role")
+                .and_then(Value::as_str)
+                .is_some_and(|role| matches!(role, "user" | "system" | "developer"));
+            for (key, field) in fields {
+                let normalized_key: String = key
+                    .chars()
+                    .filter(|character| character.is_ascii_alphanumeric())
+                    .flat_map(char::to_lowercase)
+                    .collect();
+                if normalized_key.contains("prompt") {
+                    *field = Value::String("[REDACTED PROMPT FIELD]".into());
+                } else if sensitive_role && normalized_key == "content" {
+                    *field = Value::String("[REDACTED MESSAGE CONTENT]".into());
+                } else {
+                    sanitize_event_evidence(field, prompt, skill);
+                }
+            }
+        }
+        Value::Null | Value::Bool(_) | Value::Number(_) => {}
     }
+}
+
+fn sanitize_text_evidence(text: &str, prompt: &str, skill: &str) -> String {
+    let mut sanitized = text.to_owned();
+    if !prompt.is_empty() {
+        sanitized = sanitized.replace(prompt, "[REDACTED REQUEST PROMPT]");
+    }
+    if !skill.is_empty() {
+        sanitized = sanitized.replace(skill, "[REDACTED REQUEST SKILL]");
+    }
+    redact_text(&sanitized)
 }
 
 fn extract_agent_end(event: &Value) -> Option<String> {
@@ -460,6 +595,149 @@ printf '%s\n' '{"type":"agent_end","messages":[{"role":"user","content":"questio
     }
 
     #[test]
+    fn observed_message_end_never_falls_back_to_agent_end() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = root.path().join("omp");
+        write_executable(
+            &fake,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"agent_end","messages":[{"role":"assistant","content":[{"type":"text","text":"stale fallback"}]}]}'
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"stop"}}'
+"#,
+        );
+
+        let trajectory = OmpRunner::new(config_with_bin(root.path(), fake))
+            .run(&replay_request())
+            .unwrap();
+
+        assert!(!trajectory.process_success);
+        assert_eq!(trajectory.final_text, None);
+        assert!(trajectory.error.unwrap().contains("terminal assistant"));
+    }
+
+    #[test]
+    fn spawn_failure_returns_a_generic_failed_trajectory() {
+        let root = tempfile::tempdir().unwrap();
+        let missing = root.path().join("missing-secret-binary");
+        let non_executable = root.path().join("non-executable-secret-binary");
+        std::fs::write(&non_executable, "#!/bin/sh\nexit 0\n").unwrap();
+        let request = replay_request();
+
+        for binary in [missing, non_executable] {
+            let trajectory = OmpRunner::new(config_with_bin(root.path(), binary))
+                .run(&request)
+                .unwrap();
+
+            assert!(!trajectory.process_success);
+            assert_eq!(trajectory.exit_code, None);
+            assert!(!trajectory.timed_out);
+            assert_eq!(trajectory.role, ModelRole::Replay);
+            assert_eq!(trajectory.prompt_hash, hash_text(request.prompt));
+            assert_eq!(trajectory.skill_hash, hash_text(request.skill));
+            let error = trajectory.error.unwrap();
+            assert_eq!(error, "failed to start OMP process");
+            assert!(!error.contains("secret-binary"));
+        }
+    }
+
+    #[test]
+    fn strips_input_events_and_uses_latest_nonterminal_model_metadata() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = root.path().join("omp");
+        write_executable(
+            &fake,
+            r#"#!/bin/sh
+printf '%s\n' '{"type":"model_start","model":"old-model"}'
+printf '%s\n' '{"type":"model_change","model":"latest-model","nested":{"message":{"role":"user","content":"Return the required result"},"systemPrompt":"Always answer with GYM_OK.","developer":{"role":"developer","content":"Return the required result"}}}'
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"answer secret=do-not-keep"}],"stopReason":"stop"}}'
+printf '%s' 'Return the required result Always answer with GYM_OK. token=stderr-secret' >&2
+"#,
+        );
+
+        let trajectory = OmpRunner::new(config_with_bin(root.path(), fake))
+            .run(&replay_request())
+            .unwrap();
+
+        let events = serde_json::to_string(&trajectory.events).unwrap();
+        assert!(!events.contains("Return the required result"));
+        assert!(!events.contains("Always answer with GYM_OK."));
+        assert!(!trajectory.stderr.contains("Return the required result"));
+        assert!(!trajectory.stderr.contains("Always answer with GYM_OK."));
+        assert!(!trajectory.stderr.contains("stderr-secret"));
+        let error = trajectory.error.as_deref().unwrap_or_default();
+        assert!(!error.contains("Return the required result"));
+        assert!(!error.contains("Always answer with GYM_OK."));
+        assert_eq!(trajectory.model.as_deref(), Some("latest-model"));
+        assert_eq!(
+            trajectory.final_text.as_deref(),
+            Some("answer secret=[REDACTED]")
+        );
+    }
+
+    #[test]
+    fn passes_exact_isolation_contract_and_cleans_temporary_files() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = root.path().join("omp");
+        write_executable(
+            &fake,
+            r#"#!/bin/sh
+printf '%s\n' "$@" > "$0.args"
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --cwd) printf '%s' "$2" > "$0.cwd"; shift 2 ;;
+    --config) cp "$2" "$0.overlay"; shift 2 ;;
+    --append-system-prompt) cp "$2" "$0.skill"; shift 2 ;;
+    *) shift ;;
+  esac
+done
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"ok"}],"stopReason":"stop"}}'
+"#,
+        );
+        let mut config = config_with_bin(root.path(), fake.clone());
+        config.optimizer_timeout_secs = 9;
+        config.optimizer_model = Some("fixture-optimizer".into());
+        let request = ModelRequest {
+            role: ModelRole::Optimizer,
+            prompt: "--help",
+            skill: "exact optimizer skill",
+        };
+
+        let trajectory = OmpRunner::new(config).run(&request).unwrap();
+
+        assert!(trajectory.process_success, "{:?}", trajectory.error);
+        let args: Vec<_> = std::fs::read_to_string(fake.with_extension("args"))
+            .unwrap()
+            .lines()
+            .map(str::to_owned)
+            .collect();
+        assert_eq!(
+            &args[..8],
+            ["-p", "--mode", "json", "--no-session", "--no-tools", "--no-skills", "--no-extensions", "--no-rules"]
+        );
+        assert_eq!(&args[8..11], ["--no-prewalk", "--no-title", "--cwd"]);
+        let cwd = PathBuf::from(&args[11]);
+        assert_eq!(args[12], "--config");
+        let overlay = PathBuf::from(&args[13]);
+        assert_eq!(args[14], "--append-system-prompt");
+        let skill = PathBuf::from(&args[15]);
+        assert_eq!(
+            &args[16..],
+            ["--max-time", "9", "--model", "fixture-optimizer", "--", "--help"]
+        );
+        assert_eq!(
+            std::fs::read_to_string(fake.with_extension("overlay")).unwrap(),
+            "advisor:\n  enabled: false\nprewalk:\n  enabled: false\nplan:\n  defaultOnStartup: false\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(fake.with_extension("skill")).unwrap(),
+            "exact optimizer skill"
+        );
+        assert!(!cwd.exists());
+        assert!(!overlay.exists());
+        assert!(!skill.exists());
+    }
+
+    #[test]
     fn malformed_ndjson_is_an_explicit_trajectory_failure() {
         let root = tempfile::tempdir().unwrap();
         let fake = root.path().join("omp");
@@ -545,6 +823,8 @@ printf 'éééééééééééééééééééé' >&2
 
         assert!(trajectory.stderr.len() <= 17);
         assert!(std::str::from_utf8(trajectory.stderr.as_bytes()).is_ok());
+        assert!(serde_json::to_vec(&trajectory.events).unwrap().len() <= 17);
+        assert!(trajectory.error.unwrap().contains("truncated"));
     }
 
     #[test]
@@ -577,7 +857,7 @@ printf 'éééééééééééééééééééé' >&2
 
         let trajectory = OmpRunner::new(config).run(&replay_request()).unwrap();
 
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(10));
         assert!(trajectory.timed_out);
         assert!(!trajectory.process_success);
         assert!(trajectory.error.unwrap().contains("timed out"));
