@@ -104,7 +104,22 @@ pub fn save_state(path: &Path, state: &GymState) -> Result<()> {
     atomic_write_json(path, state)
 }
 
+fn validate_proposal_id(id: &str, source: &Path) -> Result<()> {
+    if id.is_empty()
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        bail!(
+            "unsafe proposal ID in {}: expected nonempty ASCII alphanumeric, '_' or '-'",
+            source.display()
+        );
+    }
+    Ok(())
+}
+
 pub fn save_proposal(dir: &Path, proposal: &StagedProposal) -> Result<std::path::PathBuf> {
+    validate_proposal_id(&proposal.id, dir)?;
     crate::paths::ensure_dir(dir)?;
     let path = dir.join(format!("{}.json", proposal.id));
     atomic_write_json(&path, proposal)?;
@@ -123,16 +138,7 @@ pub fn load_latest_proposal(dir: &Path) -> Result<Option<StagedProposal>> {
         }
     };
     let id = raw_id.as_str();
-    if id.is_empty()
-        || !id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        bail!(
-            "unsafe proposal ID in latest proposal pointer {}: expected nonempty ASCII alphanumeric, '_' or '-'",
-            latest.display()
-        );
-    }
+    validate_proposal_id(id, &latest)?;
 
     let path = dir.join(format!("{id}.json"));
     let bytes = match std::fs::read(&path) {
@@ -157,9 +163,19 @@ pub fn load_latest_proposal(dir: &Path) -> Result<Option<StagedProposal>> {
             "proposal schema_version mismatch: observed missing, supported {SCHEMA_VERSION}, path {}",
             path.display()
         ),
-        Some(_) => serde_json::from_slice(&bytes)
-            .with_context(|| format!("parse proposal JSON {}", path.display()))
-            .map(Some),
+        Some(_) => {
+            let proposal: StagedProposal = serde_json::from_slice(&bytes)
+                .with_context(|| format!("parse proposal JSON {}", path.display()))?;
+            if proposal.id != id {
+                bail!(
+                    "proposal store integrity error: latest pointer {} names ID {id}, but proposal JSON {} contains ID {}",
+                    latest.display(),
+                    path.display(),
+                    proposal.id
+                );
+            }
+            Ok(Some(proposal))
+        }
     }
 }
 
@@ -168,6 +184,53 @@ mod tests {
     use super::*;
     use crate::types::{RunStatus, SCHEMA_VERSION};
     use tempfile::tempdir;
+
+    fn proposal(id: &str) -> StagedProposal {
+        serde_json::from_value(serde_json::json!({
+            "schema_version": SCHEMA_VERSION,
+            "id": id,
+            "run_id": "run-1",
+            "created_at": "2026-07-23T12:00:00Z",
+            "adopted_at": null,
+            "target_skill": "/project/SKILL.md",
+            "status": "accepted",
+            "summary": "candidate",
+            "base_skill_hash": "base",
+            "candidate_skill_hash": "candidate",
+            "task_store_hash": "tasks",
+            "split": {
+                "train_ids": [],
+                "validation_ids": []
+            },
+            "baseline_scores": [],
+            "candidate_scores": [],
+            "gate": {
+                "accepted": true,
+                "baseline_mean": 0.0,
+                "candidate_mean": 1.0,
+                "delta": 1.0,
+                "improved_checks": 1,
+                "regressions": [],
+                "reasons": []
+            },
+            "edit_bounds": {
+                "base_bytes": 1,
+                "candidate_bytes": 1,
+                "growth_ratio": 1.0,
+                "changed_lines": 1,
+                "max_candidate_bytes": 2,
+                "max_growth_ratio": 2.0,
+                "max_changed_lines": 2
+            },
+            "candidate_path": "/project/candidate.SKILL.md",
+            "diff_path": "/project/skill.diff",
+            "evidence_path": "/project/evidence.jsonl",
+            "backup_path": null,
+            "judge_evidence": [],
+            "notes": []
+        }))
+        .expect("build proposal fixture")
+    }
 
     #[test]
     fn load_state_reports_corrupt_json_with_path_context() {
@@ -360,6 +423,47 @@ mod tests {
 
         assert!(message.contains("read latest proposal pointer"));
         assert!(message.contains(latest.to_string_lossy().as_ref()));
+    }
+
+    #[test]
+    fn save_proposal_rejects_unsafe_id_before_path_construction() {
+        let root = tempdir().expect("create temporary directory");
+        let dir = root.path().join("proposals");
+        let absolute_id = root.path().join("absolute").to_string_lossy().into_owned();
+        let cases = [
+            ("../outside", root.path().join("outside.json")),
+            (absolute_id.as_str(), root.path().join("absolute.json")),
+            ("", dir.join(".json")),
+        ];
+
+        for (id, escaped_path) in cases {
+            let error =
+                save_proposal(&dir, &proposal(id)).expect_err("unsafe proposal ID must fail");
+            let message = format!("{error:#}");
+
+            assert!(message.contains("unsafe proposal ID"), "message: {message}");
+            assert!(!escaped_path.exists(), "escaped path: {}", escaped_path.display());
+            assert!(!dir.exists());
+            assert!(!dir.join("LATEST").exists());
+        }
+    }
+
+    #[test]
+    fn load_latest_proposal_rejects_metadata_id_mismatch() {
+        let root = tempdir().expect("create temporary directory");
+        let latest = root.path().join("LATEST");
+        let proposal_path = root.path().join("proposal-1.json");
+        std::fs::write(&latest, "proposal-1").expect("write latest pointer");
+        atomic_write_json(&proposal_path, &proposal("proposal-2")).expect("write proposal metadata");
+
+        let error = load_latest_proposal(root.path())
+            .expect_err("proposal metadata ID must match latest pointer");
+        let message = format!("{error:#}");
+
+        assert!(message.contains("integrity"));
+        assert!(message.contains("proposal-1"));
+        assert!(message.contains("proposal-2"));
+        assert!(message.contains(proposal_path.to_string_lossy().as_ref()));
     }
 
     #[test]
