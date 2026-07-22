@@ -1,4 +1,5 @@
 use crate::paths::atomic_write_json;
+use crate::evaluation::validate_check;
 use crate::types::{CheckSpec, MinedTask, ReviewStatus, TasksFile, SCHEMA_VERSION};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};
@@ -510,22 +511,7 @@ fn validate_checks(checks: &[CheckSpec]) -> Result<()> {
         bail!("approved task requires at least one check");
     }
     for check in checks {
-        match check {
-            CheckSpec::Exact { value }
-            | CheckSpec::Contains { value, .. }
-            | CheckSpec::NotContains { value, .. } => {
-                if value.trim().is_empty() {
-                    bail!("task checks cannot contain an empty value");
-                }
-            }
-            CheckSpec::Regex { pattern } => {
-                if pattern.trim().is_empty() {
-                    bail!("task regex check cannot be empty");
-                }
-                Regex::new(pattern)
-                    .with_context(|| format!("invalid task regex check {pattern:?}"))?;
-            }
-        }
+        validate_check(check)?;
     }
     Ok(())
 }

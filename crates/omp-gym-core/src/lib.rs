@@ -8,6 +8,7 @@
 //! Planned loop: harvest → review → replay → reflect → validate → stage → adopt.
 
 pub mod config;
+pub mod evaluation;
 pub mod harvest;
 pub mod mine;
 pub mod paths;
@@ -17,6 +18,7 @@ pub mod task_store;
 pub mod types;
 
 pub use config::GymConfig;
+pub use evaluation::{gate, score_trajectory, split_tasks, validate_check};
 pub use pipeline::{dry_run, run_night, GymReport};
 pub use state::{load_state, save_state, GymState};
 pub use task_store::{
