@@ -1,7 +1,10 @@
-use anyhow::{Context, Result};
+#[cfg(target_os = "macos")]
+use anyhow::Context;
+use anyhow::Result;
 use clap::{Parser, Subcommand};
 use omp_gym_core::config::GymConfig;
 use omp_gym_core::pipeline::{adopt, dry_run, run_night, status};
+#[cfg(target_os = "macos")]
 use omp_gym_core::state::{load_state, save_state, ScheduleState};
 use std::path::PathBuf;
 use std::process::Command;
@@ -302,11 +305,13 @@ fn schedule(cfg: &GymConfig, hour: u32, minute: u32, off: bool) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "macos")]
 fn fs_err_remove(path: &std::path::Path) -> Result<()> {
     std::fs::remove_file(path).with_context(|| format!("remove {}", path.display()))?;
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
