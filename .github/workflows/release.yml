@@ -1,0 +1,122 @@
+name: release-builds
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-builds-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  metadata:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v7
+      - id: package
+        name: Read package version
+        shell: bash
+        run: |
+          version=$(cargo metadata --locked --no-deps --format-version 1 | python3 -c 'import json, sys; data = json.load(sys.stdin); print(next(package["version"] for package in data["packages"] if package["name"] == "omp-gym"))')
+          printf 'version=%s\n' "$version" >>"$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF_TYPE" == "tag" && "$GITHUB_REF_NAME" != "v$version" ]]; then
+            printf 'tag %s does not match Cargo package version v%s\n' "$GITHUB_REF_NAME" "$version" >&2
+            exit 1
+          fi
+      - name: Verify release packaging contract
+        run: ./scripts/test-package-release.sh
+
+  build:
+    needs: metadata
+    name: ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+          - runner: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build release binary
+        run: cargo build --locked --release --package omp-gym --target "${{ matrix.target }}"
+      - name: Package and smoke-test binary
+        shell: bash
+        run: |
+          ./scripts/package-release.sh \
+            --version "${{ needs.metadata.outputs.version }}" \
+            --target "${{ matrix.target }}" \
+            --binary "target/${{ matrix.target }}/release/omp-gym" \
+            --output dist
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: read
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v8
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate and verify checksums
+        shell: bash
+        run: |
+          cd dist
+          sha256sum omp-gym-*.tar.gz | LC_ALL=C sort -k2 >SHA256SUMS
+          sha256sum --check SHA256SUMS
+      - name: Attest release assets
+        uses: actions/attest@v4
+        with:
+          subject-path: dist/*
+      - name: Publish immutable release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          if is_draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            if [[ "$is_draft" != "true" ]]; then
+              printf 'release %s is already published; refusing to replace immutable assets\n' "$RELEASE_TAG" >&2
+              exit 1
+            fi
+            gh release upload "$RELEASE_TAG" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$RELEASE_TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --draft \
+              --generate-notes \
+              --title "omp-gym ${RELEASE_TAG#v}"
+          fi
+          gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false

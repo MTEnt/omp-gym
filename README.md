@@ -35,36 +35,59 @@ The CLI reads `PI_CODING_AGENT_DIR` when OMP supplies a custom agent directory. 
 
 ## Install
 
+### Prebuilt release
+
+Download `SHA256SUMS` and the archive for your machine from the
+[latest GitHub release](https://github.com/MTEnt/omp-gym/releases/latest):
+
+| Platform | Archive target |
+|---|---|
+| macOS on Apple Silicon | `aarch64-apple-darwin` |
+| macOS on Intel | `x86_64-apple-darwin` |
+| Linux on ARM64 | `aarch64-unknown-linux-gnu` |
+| Linux on x86-64 | `x86_64-unknown-linux-gnu` |
+
+Verify the downloaded archive before extracting it:
+
+```bash
+# macOS
+grep "  $(basename "$ARCHIVE")$" SHA256SUMS | shasum -a 256 --check
+
+# Linux
+grep "  $(basename "$ARCHIVE")$" SHA256SUMS | sha256sum --check
+```
+
+Install the binary and bundled OMP extension:
+
+```bash
+tar -xzf "$ARCHIVE"
+cd "$(basename "$ARCHIVE" .tar.gz)"
+install -m 755 omp-gym ~/.local/bin/omp-gym
+mkdir -p ~/.omp/agent/extensions
+cp extensions/omp/gym.ts ~/.omp/agent/extensions/gym.ts
+```
+
+Ensure `~/.local/bin` is on `PATH`, then start a new OMP session so it discovers `/gym`.
+
+### Build from source
+
 ```bash
 git clone https://github.com/MTEnt/omp-gym.git
 cd omp-gym
-cargo install --path crates/omp-gym
+cargo install --locked --path crates/omp-gym
+mkdir -p ~/.omp/agent/extensions
+cp extensions/omp/gym.ts ~/.omp/agent/extensions/gym.ts
 ```
 
-Verify the installed binary:
+Verify the installation:
 
 ```bash
 omp-gym --version
 omp-gym --project . doctor
 ```
 
-### Install the OMP `/gym` command
-
-From the cloned `omp-gym` repository:
-
-```bash
-mkdir -p ~/.omp/agent/extensions
-cp extensions/omp/gym.ts ~/.omp/agent/extensions/gym.ts
-```
-
-Start a new OMP session. OMP discovers the extension automatically:
-
-```text
-/gym doctor
-/gym help
-```
-
-If the binary is somewhere other than `~/.cargo/bin/omp-gym`, set `OMP_GYM_BIN` to its absolute path before starting OMP.
+If the binary is somewhere other than `~/.cargo/bin/omp-gym` or
+`~/.local/bin/omp-gym`, set `OMP_GYM_BIN` to its absolute path before starting OMP.
 
 ## Run it today
 
