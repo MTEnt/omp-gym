@@ -2,15 +2,12 @@ use crate::config::GymConfig;
 use crate::harvest::harvest_sessions;
 use crate::mine::mine_tasks;
 use crate::paths::ensure_private_dir;
-use crate::state::{load_latest_proposal, load_state, save_proposal, save_state};
-use crate::types::{
-    GateDecision, ProposalStatus, StagedProposal, TaskSplit, TasksFile, SCHEMA_VERSION,
-};
+use crate::state::{load_latest_proposal, load_state, save_state};
+use crate::types::{TasksFile, SCHEMA_VERSION};
 use anyhow::{bail, Result};
 use chrono::Utc;
 use std::fs;
 use std::path::PathBuf;
-use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct GymReport {
@@ -86,7 +83,7 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
     })
 }
 
-/// Harvest/mine and optionally stage mock proposal metadata.
+/// Harvest/mine only; proposal staging awaits real replay, evaluation, and gating.
 /// No model runs and no skill file is evaluated or changed.
 pub fn run_night(cfg: &GymConfig, stage: bool) -> Result<GymReport> {
     if cfg.backend != "mock" {
@@ -109,63 +106,9 @@ pub fn run_night(cfg: &GymConfig, stage: bool) -> Result<GymReport> {
         );
     }
 
-    let proposal = StagedProposal {
-        schema_version: SCHEMA_VERSION,
-        id: Uuid::new_v4().to_string(),
-        run_id: String::new(),
-        created_at: Utc::now(),
-        adopted_at: None,
-        target_skill: cfg
-            .target_skill
-            .clone()
-            .unwrap_or_else(|| PathBuf::from("(unset)")),
-        status: ProposalStatus::Accepted,
-        summary: format!(
-            "Mock snapshot: {} sessions → {} tasks. Replay, reflection, and validation are not implemented.",
-            report.sessions, report.tasks
-        ),
-        base_skill_hash: String::new(),
-        candidate_skill_hash: String::new(),
-        task_store_hash: String::new(),
-        split: TaskSplit {
-            train_ids: Vec::new(),
-            validation_ids: Vec::new(),
-        },
-        baseline_scores: Vec::new(),
-        candidate_scores: Vec::new(),
-        gate: GateDecision {
-            accepted: false,
-            baseline_mean: 0.0,
-            candidate_mean: 0.0,
-            delta: 0.0,
-            improved_checks: 0,
-            regressions: Vec::new(),
-            reasons: vec!["mock proposal has not been evaluated".into()],
-        },
-        candidate_path: PathBuf::new(),
-        diff_path: PathBuf::new(),
-        evidence_path: PathBuf::new(),
-        backup_path: None,
-        judge_evidence: Vec::new(),
-        notes: vec![
-            "This proposal contains metadata only; it has no candidate skill edit.".into(),
-            "v0.1 refuses to adopt every generated mock proposal.".into(),
-        ],
-    };
-
-    let path = save_proposal(&cfg.proposal_dir(), &proposal)?;
-    let mut state = load_state(&cfg.state_path())?;
-    state.last_run_at = Some(Utc::now());
-    state.nights_completed = state.nights_completed.saturating_add(1);
-    state.last_proposal_id = Some(proposal.id.clone());
-    save_state(&cfg.state_path(), &state)?;
-
-    report.staged = true;
-    report.proposal_id = Some(proposal.id);
-    report
-        .notes
-        .push(format!("Staged proposal → {}", path.display()));
-    Ok(report)
+    bail!(
+        "mock proposal staging is disabled until replay, evaluation, and gate evidence are implemented"
+    )
 }
 
 pub fn status(cfg: &GymConfig) -> Result<String> {
@@ -251,6 +194,7 @@ pub fn adopt(cfg: &GymConfig) -> Result<String> {
 mod tests {
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tempfile::tempdir;
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -359,6 +303,33 @@ mod tests {
         assert!(error.to_string().contains("not implemented"));
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn mock_run_never_stages_an_accepted_proposal() {
+        let root = tempdir().expect("create temporary directory");
+        let project = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::create_dir_all(&sessions).expect("create sessions root");
+        write_session(
+            &sessions.join("selected.jsonl"),
+            "selected",
+            &project,
+            "Improve authentication error handling",
+        );
+
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.sessions_root = sessions;
+        config.lookback_hours = 0;
+
+        let error =
+            run_night(&config, true).expect_err("mock run must not create an accepted proposal");
+
+        assert!(error
+            .to_string()
+            .contains("mock proposal staging is disabled"));
+        assert!(!config.proposal_dir().join("LATEST").exists());
     }
 
     #[test]

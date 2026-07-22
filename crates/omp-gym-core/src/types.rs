@@ -162,6 +162,17 @@ pub struct JudgeEvidence {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CandidateBounds {
+    pub base_bytes: usize,
+    pub candidate_bytes: usize,
+    pub growth_ratio: f64,
+    pub changed_lines: usize,
+    pub max_candidate_bytes: usize,
+    pub max_growth_ratio: f64,
+    pub max_changed_lines: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct StagedProposal {
     pub schema_version: u32,
     pub id: String,
@@ -178,6 +189,7 @@ pub struct StagedProposal {
     pub baseline_scores: Vec<TaskScore>,
     pub candidate_scores: Vec<TaskScore>,
     pub gate: GateDecision,
+    pub edit_bounds: CandidateBounds,
     pub candidate_path: PathBuf,
     pub diff_path: PathBuf,
     pub evidence_path: PathBuf,
@@ -321,6 +333,15 @@ mod tests {
             baseline_scores: vec![task_score()],
             candidate_scores: vec![task_score()],
             gate: gate(),
+            edit_bounds: CandidateBounds {
+                base_bytes: 1_000,
+                candidate_bytes: 1_100,
+                growth_ratio: 1.1,
+                changed_lines: 8,
+                max_candidate_bytes: 2_000,
+                max_growth_ratio: 1.25,
+                max_changed_lines: 20,
+            },
             candidate_path: PathBuf::from("/project/candidate.SKILL.md"),
             diff_path: PathBuf::from("/project/skill.diff"),
             evidence_path: PathBuf::from("/project/evidence.jsonl"),
@@ -337,6 +358,19 @@ mod tests {
         let trajectory_json = serde_json::to_string(&trajectory).expect("serialize trajectory");
         let run_json = serde_json::to_string(&run).expect("serialize run");
         let proposal_json = serde_json::to_string(&proposal).expect("serialize proposal");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&proposal_json)
+                .expect("valid proposal json")["edit_bounds"],
+            serde_json::json!({
+                "base_bytes": 1_000,
+                "candidate_bytes": 1_100,
+                "growth_ratio": 1.1,
+                "changed_lines": 8,
+                "max_candidate_bytes": 2_000,
+                "max_growth_ratio": 1.25,
+                "max_changed_lines": 20
+            })
+        );
 
         assert_eq!(
             serde_json::from_str::<TasksFile>(&tasks_json).expect("deserialize tasks"),
@@ -363,21 +397,101 @@ mod tests {
         }
     }
 
-    #[test]
-    fn check_spec_uses_tagged_snake_case_representation() {
-        let encoded = serde_json::to_value(CheckSpec::NotContains {
-            value: "secret".into(),
-            case_sensitive: true,
-        })
-        .expect("serialize check");
+    fn assert_json_round_trip<T>(value: T, expected: serde_json::Value)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let encoded = serde_json::to_value(&value).expect("serialize variant");
+        assert_eq!(encoded, expected);
+        let decoded: T = serde_json::from_value(encoded).expect("deserialize variant");
+        assert_eq!(decoded, value);
+    }
 
-        assert_eq!(
-            encoded,
-            serde_json::json!({
-                "kind": "not_contains",
-                "value": "secret",
-                "case_sensitive": true
-            })
-        );
+    #[test]
+    fn review_status_variants_round_trip() {
+        for (variant, name) in [
+            (ReviewStatus::Pending, "pending"),
+            (ReviewStatus::Approved, "approved"),
+            (ReviewStatus::Rejected, "rejected"),
+        ] {
+            assert_json_round_trip(variant, serde_json::json!(name));
+        }
+    }
+
+    #[test]
+    fn check_spec_variants_round_trip() {
+        let cases = [
+            (
+                CheckSpec::Exact {
+                    value: "done".into(),
+                },
+                serde_json::json!({"kind": "exact", "value": "done"}),
+            ),
+            (
+                CheckSpec::Contains {
+                    value: "done".into(),
+                    case_sensitive: true,
+                },
+                serde_json::json!({
+                    "kind": "contains",
+                    "value": "done",
+                    "case_sensitive": true
+                }),
+            ),
+            (
+                CheckSpec::NotContains {
+                    value: "secret".into(),
+                    case_sensitive: false,
+                },
+                serde_json::json!({
+                    "kind": "not_contains",
+                    "value": "secret",
+                    "case_sensitive": false
+                }),
+            ),
+            (
+                CheckSpec::Regex {
+                    pattern: "^done$".into(),
+                },
+                serde_json::json!({"kind": "regex", "pattern": "^done$"}),
+            ),
+        ];
+
+        for (variant, expected) in cases {
+            assert_json_round_trip(variant, expected);
+        }
+    }
+
+    #[test]
+    fn model_role_variants_round_trip() {
+        for (variant, name) in [
+            (ModelRole::Replay, "replay"),
+            (ModelRole::Optimizer, "optimizer"),
+            (ModelRole::Judge, "judge"),
+        ] {
+            assert_json_round_trip(variant, serde_json::json!(name));
+        }
+    }
+
+    #[test]
+    fn run_status_variants_round_trip() {
+        for (variant, name) in [
+            (RunStatus::Running, "running"),
+            (RunStatus::Accepted, "accepted"),
+            (RunStatus::Rejected, "rejected"),
+            (RunStatus::Failed, "failed"),
+        ] {
+            assert_json_round_trip(variant, serde_json::json!(name));
+        }
+    }
+
+    #[test]
+    fn proposal_status_variants_round_trip() {
+        for (variant, name) in [
+            (ProposalStatus::Accepted, "accepted"),
+            (ProposalStatus::Adopted, "adopted"),
+        ] {
+            assert_json_round_trip(variant, serde_json::json!(name));
+        }
     }
 }
