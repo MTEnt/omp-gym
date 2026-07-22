@@ -1,7 +1,10 @@
-use crate::task_store::{jaccard_similarity, normalize_prompt, significant_tokens, stable_task_id};
+use crate::task_store::{
+    jaccard_similarity, prompt_signature, signatures_are_compatible, stable_task_id,
+    PromptSignature,
+};
 use crate::types::{MinedTask, ReviewStatus, SessionSummary};
 use chrono::Utc;
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeMap;
 
 const CLUSTER_THRESHOLD: f64 = 0.70;
 
@@ -13,25 +16,21 @@ pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTas
     let mut candidates = Vec::new();
     for session in sessions {
         for excerpt in &session.user_excerpts {
-            let normalized = normalize_prompt(excerpt);
-            if normalized.len() < 12 {
-                continue;
-            }
-            let tokens = significant_tokens(&normalized);
-            if tokens.is_empty() {
+            let signature = prompt_signature(excerpt);
+            if signature.normalized.len() < 12 || signature.tokens.is_empty() {
                 continue;
             }
             candidates.push(Candidate {
-                normalized,
+                signature,
                 prompt: excerpt.clone(),
                 session_id: session.id.clone(),
-                tokens,
             });
         }
     }
     candidates.sort_by(|left, right| {
-        left.normalized
-            .cmp(&right.normalized)
+        left.signature
+            .normalized
+            .cmp(&right.signature.normalized)
             .then_with(|| left.session_id.cmp(&right.session_id))
             .then_with(|| left.prompt.cmp(&right.prompt))
     });
@@ -39,24 +38,27 @@ pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTas
     let mut clusters: Vec<Cluster> = Vec::new();
     for candidate in candidates {
         let matching_cluster = clusters.iter().position(|cluster| {
-            jaccard_similarity(&cluster.tokens, &candidate.tokens) >= CLUSTER_THRESHOLD
+            signatures_are_compatible(&cluster.signature, &candidate.signature)
+                && jaccard_similarity(&cluster.signature.tokens, &candidate.signature.tokens)
+                    >= CLUSTER_THRESHOLD
         });
         if let Some(index) = matching_cluster {
             let cluster = &mut clusters[index];
-            cluster.count += 1;
-            cluster.sessions.insert(candidate.session_id);
+            *cluster
+                .source_occurrences
+                .entry(candidate.session_id)
+                .or_insert(0) += 1;
             if representative_should_change(&cluster.prompt, &candidate.prompt) {
-                cluster.title = titleize(&candidate.normalized);
+                cluster.title = titleize(&candidate.signature.normalized);
                 cluster.prompt = candidate.prompt;
-                cluster.tokens = candidate.tokens;
+                cluster.signature = candidate.signature;
             }
         } else {
             clusters.push(Cluster {
-                title: titleize(&candidate.normalized),
+                title: titleize(&candidate.signature.normalized),
                 prompt: candidate.prompt,
-                sessions: BTreeSet::from([candidate.session_id]),
-                count: 1,
-                tokens: candidate.tokens,
+                source_occurrences: BTreeMap::from([(candidate.session_id, 1)]),
+                signature: candidate.signature,
             });
         }
     }
@@ -64,19 +66,24 @@ pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTas
     let now = Utc::now();
     let mut tasks: Vec<MinedTask> = clusters
         .into_iter()
-        .map(|cluster| MinedTask {
-            id: stable_task_id(&cluster.prompt),
-            title: cluster.title,
-            prompt: cluster.prompt,
-            source_session_ids: cluster.sessions.into_iter().collect(),
-            frequency: cluster.count,
-            status: ReviewStatus::Pending,
-            checks: vec![],
-            rubric: None,
-            review_note: None,
-            reviewed_at: None,
-            first_seen_at: now,
-            last_seen_at: now,
+        .map(|cluster| {
+            let frequency = cluster.source_occurrences.values().sum();
+            let source_session_ids = cluster.source_occurrences.keys().cloned().collect();
+            MinedTask {
+                id: stable_task_id(&cluster.prompt),
+                title: cluster.title,
+                prompt: cluster.prompt,
+                source_session_ids,
+                source_occurrences: cluster.source_occurrences,
+                frequency,
+                status: ReviewStatus::Pending,
+                checks: vec![],
+                rubric: None,
+                review_note: None,
+                reviewed_at: None,
+                first_seen_at: now,
+                last_seen_at: now,
+            }
         })
         .collect();
     tasks.sort_by(|left, right| {
@@ -90,18 +97,16 @@ pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTas
 }
 
 struct Candidate {
-    normalized: String,
+    signature: PromptSignature,
     prompt: String,
     session_id: String,
-    tokens: HashSet<String>,
 }
 
 struct Cluster {
     title: String,
     prompt: String,
-    sessions: BTreeSet<String>,
-    count: usize,
-    tokens: HashSet<String>,
+    source_occurrences: BTreeMap<String, usize>,
+    signature: PromptSignature,
 }
 
 fn representative_should_change(existing: &str, incoming: &str) -> bool {
@@ -243,5 +248,45 @@ mod tests {
             mine_tasks(&[first], 1)[0].id,
             mine_tasks(&[second], 1)[0].id
         );
+    }
+
+    #[test]
+    fn mining_counts_occurrences_per_source_session() {
+        let prompt = "Fix recurring login authentication failures in auth module";
+        let tasks = mine_tasks(
+            &[
+                session("session-b", &[prompt]),
+                session("session-a", &[prompt, prompt]),
+            ],
+            10,
+        );
+
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(
+            tasks[0].source_occurrences,
+            BTreeMap::from([("session-a".into(), 2), ("session-b".into(), 1)])
+        );
+        assert_eq!(tasks[0].frequency, 3);
+        assert_eq!(tasks[0].source_session_ids, ["session-a", "session-b"]);
+    }
+
+    #[test]
+    fn mining_keeps_incompatible_actions_and_negation_separate() {
+        let tasks = mine_tasks(
+            &[session(
+                "session-a",
+                &[
+                    "Enable automatic nightly cleanup for temporary build artifact files safely",
+                    "Delete automatic nightly cleanup for temporary build artifact files safely",
+                    "Enable no automatic nightly cleanup for temporary build artifact files safely",
+                ],
+            )],
+            10,
+        );
+
+        assert_eq!(tasks.len(), 3);
+        assert!(tasks
+            .iter()
+            .all(|task| task.status == ReviewStatus::Pending));
     }
 }

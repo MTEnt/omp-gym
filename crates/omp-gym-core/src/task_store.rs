@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use regex::Regex;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -33,9 +33,9 @@ pub(crate) fn normalize_prompt(prompt: &str) -> String {
         .to_owned()
 }
 
-pub(crate) fn significant_tokens(normalized: &str) -> HashSet<String> {
-    const STOP_WORDS: [&str; 12] = [
-        "the", "a", "an", "to", "of", "and", "in", "for", "on", "please", "can", "you",
+pub(crate) fn significant_tokens(normalized: &str) -> Vec<String> {
+    const STOP_WORDS: [&str; 13] = [
+        "the", "a", "an", "to", "of", "and", "in", "for", "on", "please", "kindly", "can", "you",
     ];
 
     normalized
@@ -45,6 +45,93 @@ pub(crate) fn significant_tokens(normalized: &str) -> HashSet<String> {
         .take(24)
         .map(str::to_owned)
         .collect()
+}
+
+fn prompt_word(token: &str) -> &str {
+    token.trim_matches(|character: char| {
+        !character.is_alphanumeric() && character != '\'' && character != '’'
+    })
+}
+
+fn is_negator(token: &str) -> bool {
+    let token = prompt_word(token);
+    matches!(
+        token,
+        "not"
+            | "no"
+            | "never"
+            | "without"
+            | "cannot"
+            | "dont"
+            | "wont"
+            | "cant"
+            | "doesnt"
+            | "didnt"
+            | "isnt"
+            | "arent"
+            | "wasnt"
+            | "werent"
+            | "shouldnt"
+            | "wouldnt"
+            | "couldnt"
+            | "mustnt"
+            | "neednt"
+            | "havent"
+            | "hasnt"
+            | "hadnt"
+    ) || token.ends_with("n't")
+        || token.ends_with("n’t")
+}
+
+fn is_auxiliary(token: &str) -> bool {
+    matches!(
+        prompt_word(token),
+        "do" | "does"
+            | "did"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "have"
+            | "has"
+            | "had"
+            | "can"
+            | "could"
+            | "may"
+            | "might"
+            | "must"
+            | "shall"
+            | "should"
+            | "will"
+            | "would"
+    )
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct PromptSignature {
+    pub(crate) normalized: String,
+    pub(crate) tokens: HashSet<String>,
+    pub(crate) action_anchor: Option<String>,
+    pub(crate) negated: bool,
+}
+
+pub(crate) fn prompt_signature(prompt: &str) -> PromptSignature {
+    let normalized = normalize_prompt(prompt);
+    let sequence = significant_tokens(&normalized);
+    let negated = normalized.split_whitespace().any(is_negator);
+    let action_anchor = sequence
+        .iter()
+        .find(|token| !is_negator(token) && !is_auxiliary(token))
+        .cloned();
+    PromptSignature {
+        normalized,
+        tokens: sequence.iter().cloned().collect(),
+        action_anchor,
+        negated,
+    }
 }
 
 pub(crate) fn jaccard_similarity(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
@@ -106,9 +193,29 @@ fn ensure_matching_project(stored: &Path, expected: &Path, source: &Path) -> Res
     Ok(())
 }
 
-fn sort_and_deduplicate_sources(task: &mut MinedTask) {
+fn occurrence_sum(occurrences: &BTreeMap<String, usize>) -> usize {
+    occurrences
+        .values()
+        .fold(0usize, |total, count| total.saturating_add(*count))
+}
+
+fn normalize_task_sources(task: &mut MinedTask) {
     task.source_session_ids.sort();
     task.source_session_ids.dedup();
+    if !task.source_occurrences.is_empty() {
+        task.source_session_ids = task.source_occurrences.keys().cloned().collect();
+        task.frequency = occurrence_sum(&task.source_occurrences);
+    }
+}
+
+fn validate_task_timestamps(task: &MinedTask) -> Result<()> {
+    if task.first_seen_at > task.last_seen_at {
+        bail!(
+            "task {} has invalid timestamp order: first_seen_at is after last_seen_at",
+            task.id
+        );
+    }
+    Ok(())
 }
 
 pub fn load_tasks(path: &Path, project: &Path) -> Result<TasksFile> {
@@ -157,7 +264,9 @@ pub fn load_tasks(path: &Path, project: &Path) -> Result<TasksFile> {
         ensure_matching_project(&file.project, &project, path)?;
         file.project = project;
         for task in &mut file.tasks {
-            sort_and_deduplicate_sources(task);
+            normalize_task_sources(task);
+            validate_task_timestamps(task)
+                .with_context(|| format!("invalid task timestamp in {}", path.display()))?;
         }
         return Ok(file);
     }
@@ -169,13 +278,14 @@ pub fn load_tasks(path: &Path, project: &Path) -> Result<TasksFile> {
     let tasks = legacy
         .tasks
         .into_iter()
-        .map(|legacy_task| {
+        .map(|legacy_task| -> Result<MinedTask> {
             let _legacy_reviewed = legacy_task.reviewed;
             let mut task = MinedTask {
                 id: legacy_task.id,
                 title: legacy_task.title,
                 prompt: legacy_task.prompt,
                 source_session_ids: legacy_task.source_session_ids,
+                source_occurrences: BTreeMap::new(),
                 frequency: legacy_task.frequency,
                 status: ReviewStatus::Pending,
                 checks: vec![],
@@ -185,10 +295,11 @@ pub fn load_tasks(path: &Path, project: &Path) -> Result<TasksFile> {
                 first_seen_at: legacy.generated_at,
                 last_seen_at: legacy.generated_at,
             };
-            sort_and_deduplicate_sources(&mut task);
-            task
+            normalize_task_sources(&mut task);
+            validate_task_timestamps(&task)?;
+            Ok(task)
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(TasksFile {
         schema_version: SCHEMA_VERSION,
         generated_at: legacy.generated_at,
@@ -203,58 +314,83 @@ fn representative_should_change(existing: &str, incoming: &str) -> bool {
     incoming_length > existing_length || (incoming_length == existing_length && incoming < existing)
 }
 
-fn merge_frequency(existing: &MinedTask, incoming: &MinedTask) -> usize {
-    let existing_sources: HashSet<&str> = existing
+fn merge_task_sources(existing: &mut MinedTask, incoming: &MinedTask) {
+    let all_sources: Vec<String> = existing
         .source_session_ids
         .iter()
-        .map(String::as_str)
+        .chain(&incoming.source_session_ids)
+        .cloned()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
         .collect();
-    let incoming_sources: HashSet<&str> = incoming
-        .source_session_ids
-        .iter()
-        .map(String::as_str)
-        .collect();
-    if incoming_sources.is_empty() || existing_sources.is_empty() {
-        return existing.frequency.max(incoming.frequency);
+    let existing_complete = !existing.source_occurrences.is_empty();
+    let incoming_complete = !incoming.source_occurrences.is_empty();
+
+    match (existing_complete, incoming_complete) {
+        (true, true) => {
+            for (source, incoming_count) in &incoming.source_occurrences {
+                let existing_count = existing
+                    .source_occurrences
+                    .entry(source.clone())
+                    .or_insert(0);
+                *existing_count = (*existing_count).max(*incoming_count);
+            }
+        }
+        (false, true)
+            if existing
+                .source_session_ids
+                .iter()
+                .all(|source| incoming.source_occurrences.contains_key(source))
+                && incoming.frequency >= existing.frequency =>
+        {
+            existing.source_occurrences = incoming.source_occurrences.clone();
+        }
+        (true, false)
+            if incoming
+                .source_session_ids
+                .iter()
+                .all(|source| existing.source_occurrences.contains_key(source))
+                && existing.frequency >= incoming.frequency => {}
+        _ => {
+            existing.source_occurrences.clear();
+            existing.frequency = existing.frequency.max(incoming.frequency);
+        }
     }
-    let overlap = existing_sources.intersection(&incoming_sources).count();
-    if overlap == 0 {
-        existing.frequency.saturating_add(incoming.frequency)
+
+    if existing.source_occurrences.is_empty() {
+        existing.source_session_ids = all_sources;
     } else {
-        let new_sources = incoming_sources.difference(&existing_sources).count();
-        existing
-            .frequency
-            .saturating_add(new_sources)
-            .max(incoming.frequency)
+        existing.source_session_ids = existing.source_occurrences.keys().cloned().collect();
+        existing.frequency = occurrence_sum(&existing.source_occurrences);
     }
 }
 
 fn merge_into(existing: &mut MinedTask, incoming: MinedTask, now: DateTime<Utc>) {
-    let merged_frequency = merge_frequency(existing, &incoming);
-    if representative_should_change(&existing.prompt, &incoming.prompt) {
+    if existing.status == ReviewStatus::Pending
+        && representative_should_change(&existing.prompt, &incoming.prompt)
+    {
         existing.prompt = incoming.prompt.clone();
         existing.title = incoming.title.clone();
     }
-    existing
-        .source_session_ids
-        .extend(incoming.source_session_ids);
-    sort_and_deduplicate_sources(existing);
-    existing.frequency = merged_frequency;
+    merge_task_sources(existing, &incoming);
     existing.first_seen_at = existing.first_seen_at.min(incoming.first_seen_at);
-    existing.last_seen_at = now;
+    existing.last_seen_at = existing.last_seen_at.max(incoming.last_seen_at).max(now);
 }
 
-fn unique_fuzzy_match(existing: &[MinedTask], incoming: &MinedTask) -> Option<usize> {
-    let incoming_tokens = significant_tokens(&normalize_prompt(&incoming.prompt));
+pub(crate) fn signatures_are_compatible(left: &PromptSignature, right: &PromptSignature) -> bool {
+    left.action_anchor == right.action_anchor && left.negated == right.negated
+}
+
+fn unique_fuzzy_match(existing: &[PromptSignature], incoming: &PromptSignature) -> Option<usize> {
     let mut best_index = None;
     let mut best_score = 0.0;
     let mut tied = false;
 
-    for (index, task) in existing.iter().enumerate() {
-        let score = jaccard_similarity(
-            &significant_tokens(&normalize_prompt(&task.prompt)),
-            &incoming_tokens,
-        );
+    for (index, signature) in existing.iter().enumerate() {
+        if !signatures_are_compatible(signature, incoming) {
+            continue;
+        }
+        let score = jaccard_similarity(&signature.tokens, &incoming.tokens);
         if score > best_score {
             best_index = Some(index);
             best_score = score;
@@ -277,43 +413,54 @@ pub fn merge_tasks(
     now: DateTime<Utc>,
 ) -> Result<Vec<MinedTask>> {
     for task in &mut existing {
-        sort_and_deduplicate_sources(task);
+        normalize_task_sources(task);
+        validate_task_timestamps(task)?;
     }
     let original_existing_count = existing.len();
     let original_ids: HashSet<String> = existing.iter().map(|task| task.id.clone()).collect();
 
-    let mut mined_with_keys: Vec<(String, MinedTask)> = mined
+    let mut mined_with_signatures: Vec<(PromptSignature, MinedTask)> = mined
         .into_iter()
-        .map(|mut task| {
-            sort_and_deduplicate_sources(&mut task);
-            (normalize_prompt(&task.prompt), task)
+        .map(|mut task| -> Result<_> {
+            normalize_task_sources(&mut task);
+            validate_task_timestamps(&task)?;
+            let signature = prompt_signature(&task.prompt);
+            Ok((signature, task))
         })
-        .collect();
-    mined_with_keys.sort_by(|left, right| {
+        .collect::<Result<Vec<_>>>()?;
+    mined_with_signatures.sort_by(|left, right| {
         left.0
-            .cmp(&right.0)
+            .normalized
+            .cmp(&right.0.normalized)
             .then_with(|| left.1.id.cmp(&right.1.id))
     });
-    let (exact, remaining): (Vec<_>, Vec<_>) = mined_with_keys
+    let (exact, remaining): (Vec<_>, Vec<_>) = mined_with_signatures
         .into_iter()
-        .map(|(_, task)| task)
-        .partition(|task| original_ids.contains(&task.id));
+        .partition(|(_, task)| original_ids.contains(&task.id));
 
-    for incoming in exact {
+    for (_, incoming) in exact {
         let index = existing
             .iter()
             .position(|task| task.id == incoming.id)
             .expect("exact task ID came from the existing store");
         merge_into(&mut existing[index], incoming, now);
     }
+    let mut existing_signatures: Vec<PromptSignature> = existing[..original_existing_count]
+        .iter()
+        .map(|task| prompt_signature(&task.prompt))
+        .collect();
 
-    for mut incoming in remaining {
+    for (incoming_signature, mut incoming) in remaining {
         if let Some(index) = existing.iter().position(|task| task.id == incoming.id) {
             merge_into(&mut existing[index], incoming, now);
+            if index < original_existing_count {
+                existing_signatures[index] = prompt_signature(&existing[index].prompt);
+            }
             continue;
         }
-        if let Some(index) = unique_fuzzy_match(&existing[..original_existing_count], &incoming) {
+        if let Some(index) = unique_fuzzy_match(&existing_signatures, &incoming_signature) {
             merge_into(&mut existing[index], incoming, now);
+            existing_signatures[index] = prompt_signature(&existing[index].prompt);
             continue;
         }
 
@@ -322,7 +469,8 @@ pub fn merge_tasks(
         incoming.rubric = None;
         incoming.review_note = None;
         incoming.reviewed_at = None;
-        incoming.last_seen_at = now;
+        incoming.last_seen_at = incoming.last_seen_at.max(now);
+        validate_task_timestamps(&incoming)?;
         existing.push(incoming);
     }
 
@@ -343,7 +491,18 @@ pub fn save_tasks(path: &Path, file: &TasksFile) -> Result<()> {
             SCHEMA_VERSION
         );
     }
-    atomic_write_json(path, file).with_context(|| format!("save tasks file {}", path.display()))
+    let mut normalized = file.clone();
+    for task in &mut normalized.tasks {
+        normalize_task_sources(task);
+        validate_task_timestamps(task).with_context(|| {
+            format!(
+                "refuse to save invalid task timestamp to {}",
+                path.display()
+            )
+        })?;
+    }
+    atomic_write_json(path, &normalized)
+        .with_context(|| format!("save tasks file {}", path.display()))
 }
 
 fn validate_checks(checks: &[CheckSpec]) -> Result<()> {
@@ -432,6 +591,7 @@ mod tests {
     use super::*;
     use crate::types::{CheckSpec, MinedTask, ReviewStatus, TasksFile, SCHEMA_VERSION};
     use chrono::{DateTime, TimeZone, Utc};
+    use std::collections::BTreeSet;
     use std::path::Path;
     use tempfile::tempdir;
 
@@ -442,11 +602,33 @@ mod tests {
     }
 
     fn pending(id: &str, prompt: &str, sources: &[&str], frequency: usize) -> MinedTask {
+        let unique_sources: Vec<String> = sources
+            .iter()
+            .map(|source| (*source).to_owned())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        let base = if unique_sources.is_empty() {
+            0
+        } else {
+            frequency / unique_sources.len()
+        };
+        let remainder = if unique_sources.is_empty() {
+            0
+        } else {
+            frequency % unique_sources.len()
+        };
+        let source_occurrences = unique_sources
+            .iter()
+            .enumerate()
+            .map(|(index, source)| (source.clone(), base + usize::from(index < remainder)))
+            .collect();
         MinedTask {
             id: id.into(),
             title: format!("Title for {prompt}"),
             prompt: prompt.into(),
-            source_session_ids: sources.iter().map(|source| (*source).into()).collect(),
+            source_session_ids: unique_sources,
+            source_occurrences,
             frequency,
             status: ReviewStatus::Pending,
             checks: vec![],
@@ -525,7 +707,8 @@ mod tests {
         assert_eq!(task.reviewed_at, Some(at(11)));
         assert_eq!(task.first_seen_at, at(9));
         assert_eq!(task.last_seen_at, at(12));
-        assert_eq!(task.prompt, incoming_prompt);
+        assert_eq!(task.prompt, "Fix login failures in auth module");
+        assert_eq!(task.title, "Title for Fix login failures in auth module");
         assert_eq!(
             task.source_session_ids,
             ["session-a", "session-b", "session-c"]
@@ -547,6 +730,75 @@ mod tests {
     }
 
     #[test]
+    fn partial_overlap_uses_per_source_max_and_repeat_harvest_is_idempotent() {
+        let prompt = "Fix recurring login authentication failures";
+        let id = stable_task_id(prompt);
+        let mut existing = pending(&id, prompt, &["session-a", "session-b"], 5);
+        existing.source_occurrences =
+            BTreeMap::from([("session-a".into(), 2), ("session-b".into(), 3)]);
+        let mut incoming = pending(&id, prompt, &["session-b", "session-c"], 7);
+        incoming.source_occurrences =
+            BTreeMap::from([("session-b".into(), 5), ("session-c".into(), 2)]);
+        incoming.last_seen_at = at(13);
+
+        let merged =
+            merge_tasks(vec![existing], vec![incoming.clone()], at(12)).expect("first merge");
+
+        assert_eq!(
+            merged[0].source_occurrences,
+            BTreeMap::from([
+                ("session-a".into(), 2),
+                ("session-b".into(), 5),
+                ("session-c".into(), 2),
+            ])
+        );
+        assert_eq!(merged[0].frequency, 9);
+        assert_eq!(merged[0].last_seen_at, at(13));
+
+        let repeated = merge_tasks(merged.clone(), vec![incoming], at(12)).expect("repeat merge");
+        assert_eq!(repeated, merged);
+    }
+
+    #[test]
+    fn incomplete_legacy_counts_reconcile_only_from_a_covering_snapshot() {
+        let prompt = "Fix recurring login authentication failures";
+        let id = stable_task_id(prompt);
+        let mut legacy = pending(&id, prompt, &["session-a", "session-b"], 3);
+        legacy.source_occurrences.clear();
+        let covering = pending(&id, prompt, &["session-a", "session-b"], 3);
+
+        let reconciled =
+            merge_tasks(vec![legacy], vec![covering.clone()], at(12)).expect("reconcile counts");
+
+        assert_eq!(
+            reconciled[0].source_occurrences,
+            covering.source_occurrences
+        );
+        assert_eq!(reconciled[0].frequency, 3);
+        let repeated =
+            merge_tasks(reconciled.clone(), vec![covering], at(12)).expect("repeat harvest");
+        assert_eq!(repeated, reconciled);
+    }
+
+    #[test]
+    fn partial_snapshot_does_not_inflate_incomplete_legacy_counts() {
+        let prompt = "Fix recurring login authentication failures";
+        let id = stable_task_id(prompt);
+        let mut legacy = pending(&id, prompt, &["session-a", "session-b"], 3);
+        legacy.source_occurrences.clear();
+        let partial = pending(&id, prompt, &["session-b", "session-c"], 2);
+
+        let merged = merge_tasks(vec![legacy], vec![partial], at(12)).expect("merge partial");
+
+        assert!(merged[0].source_occurrences.is_empty());
+        assert_eq!(merged[0].frequency, 3);
+        assert_eq!(
+            merged[0].source_session_ids,
+            ["session-a", "session-b", "session-c"]
+        );
+    }
+
+    #[test]
     fn rejected_tasks_stay_rejected_and_new_tasks_stay_pending() {
         let prompt = "Repair authentication failures in the login service";
         let id = stable_task_id(prompt);
@@ -554,7 +806,14 @@ mod tests {
         rejected.status = ReviewStatus::Rejected;
         rejected.review_note = Some("out of scope".into());
         rejected.reviewed_at = Some(at(11));
-        let reharvested = pending(&id, prompt, &["new"], 1);
+        let reharvested_prompt =
+            "Repair recurring authentication failures in the login service today";
+        let reharvested = pending(
+            &stable_task_id(reharvested_prompt),
+            reharvested_prompt,
+            &["new"],
+            1,
+        );
         let new_prompt = "Document the deployment rollback procedure";
         let new_task = pending(&stable_task_id(new_prompt), new_prompt, &["new"], 1);
 
@@ -567,6 +826,8 @@ mod tests {
             .expect("preserved rejected task");
         assert_eq!(rejected.status, ReviewStatus::Rejected);
         assert_eq!(rejected.review_note.as_deref(), Some("out of scope"));
+        assert_eq!(rejected.prompt, prompt);
+        assert_eq!(rejected.title, format!("Title for {prompt}"));
         let new_task = merged
             .iter()
             .find(|task| task.prompt == new_prompt)
@@ -629,6 +890,108 @@ mod tests {
     }
 
     #[test]
+    fn incompatible_actions_and_negation_do_not_fuzzy_merge() {
+        let enabled = "Enable automatic nightly cleanup for temporary build artifact files safely";
+        let deleted = "Delete automatic nightly cleanup for temporary build artifact files safely";
+        let negated =
+            "Enable no automatic nightly cleanup for temporary build artifact files safely";
+
+        let action_split = merge_tasks(
+            vec![pending(&stable_task_id(enabled), enabled, &["old"], 1)],
+            vec![pending(&stable_task_id(deleted), deleted, &["new"], 1)],
+            at(12),
+        )
+        .expect("merge incompatible actions");
+        assert_eq!(action_split.len(), 2);
+        assert!(action_split
+            .iter()
+            .all(|task| task.status == ReviewStatus::Pending));
+
+        let negation_split = merge_tasks(
+            vec![pending(&stable_task_id(enabled), enabled, &["old"], 1)],
+            vec![pending(&stable_task_id(negated), negated, &["new"], 1)],
+            at(12),
+        )
+        .expect("merge incompatible negation");
+        assert_eq!(negation_split.len(), 2);
+        assert!(negation_split
+            .iter()
+            .all(|task| task.status == ReviewStatus::Pending));
+    }
+
+    #[test]
+    fn contractions_mark_negation_and_do_not_merge_with_positive_tasks() {
+        for contraction in [
+            "doesn't",
+            "won't",
+            "didn't",
+            "isn't",
+            "shouldn't",
+            "couldn't",
+        ] {
+            let signature = prompt_signature(&format!(
+                "Configure cleanup so it {contraction} delete temporary files"
+            ));
+            assert!(signature.negated, "{contraction} must mark negation");
+        }
+
+        let positive = "Configure cleanup to delete temporary files";
+        let negative = "Configure cleanup so it doesn't delete temporary files";
+        let merged = merge_tasks(
+            vec![pending(&stable_task_id(positive), positive, &["old"], 1)],
+            vec![pending(&stable_task_id(negative), negative, &["new"], 1)],
+            at(12),
+        )
+        .expect("merge opposite polarity");
+        assert_eq!(merged.len(), 2);
+    }
+
+    #[test]
+    fn equivalent_negative_phrasings_share_the_action_anchor() {
+        let first =
+            "Do not enable automatic nightly cleanup for temporary build artifact files safely";
+        let second =
+            "Never enable automatic nightly cleanup for temporary build artifact files safely";
+        assert_eq!(
+            prompt_signature(first).action_anchor.as_deref(),
+            Some("enable")
+        );
+        assert_eq!(
+            prompt_signature(second).action_anchor.as_deref(),
+            Some("enable")
+        );
+
+        let merged = merge_tasks(
+            vec![pending(&stable_task_id(first), first, &["old"], 1)],
+            vec![pending(&stable_task_id(second), second, &["new"], 1)],
+            at(12),
+        )
+        .expect("merge equivalent negative phrasings");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].frequency, 2);
+    }
+
+    #[test]
+    fn polite_request_prefix_does_not_replace_the_action_anchor() {
+        let plain = "Enable automatic nightly cleanup for temporary build artifact files safely";
+        let polite =
+            "Kindly enable automatic nightly cleanup for temporary build artifact files safely";
+        assert_eq!(
+            prompt_signature(polite).action_anchor.as_deref(),
+            Some("enable")
+        );
+
+        let merged = merge_tasks(
+            vec![pending(&stable_task_id(plain), plain, &["old"], 1)],
+            vec![pending(&stable_task_id(polite), polite, &["new"], 1)],
+            at(12),
+        )
+        .expect("merge polite equivalent");
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].frequency, 2);
+    }
+
+    #[test]
     fn merge_is_deterministic_when_mined_order_changes() {
         let existing = pending("task-existing", "alpha beta gamma delta", &["old"], 1);
         let extra_prompt = "alpha beta gamma delta extra";
@@ -659,6 +1022,52 @@ mod tests {
         assert_eq!(loaded.schema_version, SCHEMA_VERSION);
         assert_eq!(loaded.project, canonical);
         assert!(loaded.tasks.is_empty());
+    }
+
+    #[test]
+    fn save_rejects_reversed_task_timestamps() {
+        let root = tempdir().expect("temporary directory");
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).expect("create project");
+        let path = root.path().join("tasks.json");
+        let mut task = pending("task-a", "Fix recurring authentication failures", &["s"], 1);
+        task.first_seen_at = at(12);
+        task.last_seen_at = at(10);
+
+        let error = save_tasks(
+            &path,
+            &file(
+                &project.canonicalize().expect("canonical project"),
+                vec![task],
+            ),
+        )
+        .expect_err("invalid timestamps must not save");
+
+        assert!(error.to_string().contains("timestamp"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn load_rejects_reversed_task_timestamps() {
+        let root = tempdir().expect("temporary directory");
+        let project = root.path().join("project");
+        std::fs::create_dir(&project).expect("create project");
+        let path = root.path().join("tasks.json");
+        let mut task = pending("task-a", "Fix recurring authentication failures", &["s"], 1);
+        task.first_seen_at = at(12);
+        task.last_seen_at = at(10);
+        atomic_write_json(
+            &path,
+            &file(
+                &project.canonicalize().expect("canonical project"),
+                vec![task],
+            ),
+        )
+        .expect("write invalid fixture");
+
+        let error = load_tasks(&path, &project).expect_err("invalid timestamps must not load");
+
+        assert!(error.to_string().contains("timestamp"));
     }
 
     #[test]
@@ -697,6 +1106,8 @@ mod tests {
             loaded.tasks[0].source_session_ids,
             ["session-a", "session-b"]
         );
+        assert!(loaded.tasks[0].source_occurrences.is_empty());
+        assert_eq!(loaded.tasks[0].frequency, 3);
     }
 
     #[test]

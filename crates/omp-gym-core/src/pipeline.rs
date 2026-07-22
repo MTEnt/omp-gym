@@ -24,6 +24,13 @@ pub struct GymReport {
 
 /// Harvest + mine + merge into tasks.json without changing review decisions.
 pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
+    dry_run_with_state_saver(cfg, save_state)
+}
+
+fn dry_run_with_state_saver<F>(cfg: &GymConfig, state_saver: F) -> Result<GymReport>
+where
+    F: FnOnce(&std::path::Path, &crate::state::GymState) -> Result<()>,
+{
     ensure_private_dir(&cfg.gym_dir())?;
     let sessions = harvest_sessions(
         &cfg.sessions_root,
@@ -34,6 +41,7 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
     let mined = mine_tasks(&sessions, cfg.max_tasks);
     let now = Utc::now();
     let mut tasks_file = load_tasks(&cfg.tasks_path(), &cfg.project)?;
+    let mut state = load_state(&cfg.state_path())?;
     let existing_ids: BTreeSet<String> = tasks_file
         .tasks
         .iter()
@@ -60,10 +68,11 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
     let task_count = tasks_file.tasks.len();
     save_tasks(&cfg.tasks_path(), &tasks_file)?;
 
-    let mut state = load_state(&cfg.state_path())?;
     state.last_harvest_at = Some(now);
     state.last_session_ids = sessions.iter().map(|session| session.id.clone()).collect();
-    save_state(&cfg.state_path(), &state)?;
+    let state_save_warning = state_saver(&cfg.state_path(), &state)
+        .err()
+        .map(|error| format!("Warning: tasks saved but state update failed: {error:#}"));
 
     let mut notes = vec![
         format!(
@@ -81,6 +90,9 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
         ),
         "No skill files were modified.".into(),
     ];
+    if let Some(warning) = state_save_warning {
+        notes.push(warning);
+    }
     if cfg.backend != "mock" {
         notes.push(format!(
             "backend={} requested; v0.1 dry-run stays offline (mock harvest/mine only).",
@@ -346,6 +358,72 @@ mod tests {
             .notes
             .iter()
             .any(|note| note == "Task store: 0 new, 1 preserved approved, 1 total"));
+    }
+
+    #[test]
+    fn dry_run_warns_but_succeeds_when_state_save_fails_after_tasks_save() {
+        let root = tempdir().expect("create temporary directory");
+        let project = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::create_dir_all(&sessions).expect("create sessions root");
+        write_session(
+            &sessions.join("selected.jsonl"),
+            "selected",
+            &project,
+            "Fix recurring login authentication failures in the auth module",
+        );
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.sessions_root = sessions;
+        config.lookback_hours = 0;
+
+        let report = dry_run_with_state_saver(&config, |_, _| {
+            anyhow::bail!("simulated state write failure")
+        })
+        .expect("task store remains authoritative");
+
+        assert!(config.tasks_path().exists());
+        assert!(!config.state_path().exists());
+        assert!(report.notes.iter().any(|note| {
+            note.contains("Warning:")
+                && note.contains("state")
+                && note.contains("simulated state write failure")
+        }));
+    }
+
+    #[test]
+    fn corrupt_state_aborts_before_tasks_are_mutated() {
+        let root = tempdir().expect("create temporary directory");
+        let project = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::create_dir_all(&sessions).expect("create sessions root");
+        write_session(
+            &sessions.join("selected.jsonl"),
+            "selected",
+            &project,
+            "Fix recurring login authentication failures in the auth module",
+        );
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.sessions_root = sessions.clone();
+        config.lookback_hours = 0;
+        dry_run(&config).expect("initial dry run");
+        let original_tasks = std::fs::read(config.tasks_path()).expect("read initial tasks");
+        std::fs::write(config.state_path(), b"{corrupt").expect("corrupt state");
+        write_session(
+            &sessions.join("new.jsonl"),
+            "new",
+            &project,
+            "Document the deployment rollback procedure carefully",
+        );
+
+        let error = dry_run(&config).expect_err("corrupt state must abort");
+
+        assert!(error.to_string().contains("state"));
+        assert_eq!(
+            std::fs::read(config.tasks_path()).expect("read unchanged tasks"),
+            original_tasks
+        );
     }
 
     #[test]

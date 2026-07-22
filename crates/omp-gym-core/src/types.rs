@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub const SCHEMA_VERSION: u32 = 2;
@@ -41,6 +42,8 @@ pub struct MinedTask {
     pub title: String,
     pub prompt: String,
     pub source_session_ids: Vec<String>,
+    #[serde(default)]
+    pub source_occurrences: BTreeMap<String, usize>,
     pub frequency: usize,
     pub status: ReviewStatus,
     pub checks: Vec<CheckSpec>,
@@ -256,6 +259,7 @@ mod tests {
             title: "Example".into(),
             prompt: "Return done".into(),
             source_session_ids: vec!["session-1".into()],
+            source_occurrences: BTreeMap::from([("session-1".into(), 2)]),
             frequency: 2,
             status: ReviewStatus::Approved,
             checks: vec![CheckSpec::Exact {
@@ -359,8 +363,8 @@ mod tests {
         let run_json = serde_json::to_string(&run).expect("serialize run");
         let proposal_json = serde_json::to_string(&proposal).expect("serialize proposal");
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(&proposal_json)
-                .expect("valid proposal json")["edit_bounds"],
+            serde_json::from_str::<serde_json::Value>(&proposal_json).expect("valid proposal json")
+                ["edit_bounds"],
             serde_json::json!({
                 "base_bytes": 1_000,
                 "candidate_bytes": 1_100,
