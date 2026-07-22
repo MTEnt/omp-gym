@@ -1,121 +1,113 @@
+use crate::task_store::{jaccard_similarity, normalize_prompt, significant_tokens, stable_task_id};
 use crate::types::{MinedTask, ReviewStatus, SessionSummary};
 use chrono::Utc;
-use regex::Regex;
-use std::collections::HashSet;
-use uuid::Uuid;
+use std::collections::{BTreeSet, HashSet};
+
+const CLUSTER_THRESHOLD: f64 = 0.70;
 
 /// Mine recurring / representative tasks from harvested sessions.
-/// v0.1: normalize user excerpts, cluster by token similarity, rank by frequency.
+///
+/// Candidates and output are sorted so filesystem/session enumeration cannot
+/// change clustering, task identity, or ranking.
 pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTask> {
-    let mut clusters: Vec<Cluster> = Vec::new();
-
+    let mut candidates = Vec::new();
     for session in sessions {
         for excerpt in &session.user_excerpts {
-            let norm = normalize(excerpt);
-            if norm.len() < 12 {
+            let normalized = normalize_prompt(excerpt);
+            if normalized.len() < 12 {
                 continue;
             }
-            let tokens = significant_tokens(&norm);
+            let tokens = significant_tokens(&normalized);
             if tokens.is_empty() {
                 continue;
             }
-            let matching_cluster = clusters
-                .iter()
-                .position(|cluster| token_similarity(&cluster.tokens, &tokens) >= 0.7);
-            if matching_cluster.is_none() {
-                clusters.push(Cluster {
-                    title: titleize(&norm),
-                    prompt: excerpt.clone(),
-                    sessions: Vec::new(),
-                    count: 0,
-                    tokens,
-                });
+            candidates.push(Candidate {
+                normalized,
+                prompt: excerpt.clone(),
+                session_id: session.id.clone(),
+                tokens,
+            });
+        }
+    }
+    candidates.sort_by(|left, right| {
+        left.normalized
+            .cmp(&right.normalized)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+            .then_with(|| left.prompt.cmp(&right.prompt))
+    });
+
+    let mut clusters: Vec<Cluster> = Vec::new();
+    for candidate in candidates {
+        let matching_cluster = clusters.iter().position(|cluster| {
+            jaccard_similarity(&cluster.tokens, &candidate.tokens) >= CLUSTER_THRESHOLD
+        });
+        if let Some(index) = matching_cluster {
+            let cluster = &mut clusters[index];
+            cluster.count += 1;
+            cluster.sessions.insert(candidate.session_id);
+            if representative_should_change(&cluster.prompt, &candidate.prompt) {
+                cluster.title = titleize(&candidate.normalized);
+                cluster.prompt = candidate.prompt;
+                cluster.tokens = candidate.tokens;
             }
-            let cluster_index = matching_cluster.unwrap_or(clusters.len() - 1);
-            let entry = &mut clusters[cluster_index];
-            entry.count += 1;
-            if !entry.sessions.iter().any(|s| s == &session.id) {
-                entry.sessions.push(session.id.clone());
-            }
-            // keep longest prompt as canonical
-            if excerpt.len() > entry.prompt.len() {
-                entry.prompt = excerpt.clone();
-                entry.title = titleize(&norm);
-            }
+        } else {
+            clusters.push(Cluster {
+                title: titleize(&candidate.normalized),
+                prompt: candidate.prompt,
+                sessions: BTreeSet::from([candidate.session_id]),
+                count: 1,
+                tokens: candidate.tokens,
+            });
         }
     }
 
-    let mut items = clusters;
-    items.sort_by(|a, b| {
-        b.count
-            .cmp(&a.count)
-            .then(b.prompt.len().cmp(&a.prompt.len()))
-    });
-
-    items
+    let now = Utc::now();
+    let mut tasks: Vec<MinedTask> = clusters
         .into_iter()
-        .take(max_tasks)
-        .map(|c| {
-            let now = Utc::now();
-            MinedTask {
-                id: Uuid::new_v4().to_string(),
-                title: c.title,
-                prompt: c.prompt,
-                source_session_ids: c.sessions,
-                frequency: c.count,
-                status: ReviewStatus::Pending,
-                checks: Vec::new(),
-                rubric: None,
-                review_note: None,
-                reviewed_at: None,
-                first_seen_at: now,
-                last_seen_at: now,
-            }
+        .map(|cluster| MinedTask {
+            id: stable_task_id(&cluster.prompt),
+            title: cluster.title,
+            prompt: cluster.prompt,
+            source_session_ids: cluster.sessions.into_iter().collect(),
+            frequency: cluster.count,
+            status: ReviewStatus::Pending,
+            checks: vec![],
+            rubric: None,
+            review_note: None,
+            reviewed_at: None,
+            first_seen_at: now,
+            last_seen_at: now,
         })
-        .collect()
+        .collect();
+    tasks.sort_by(|left, right| {
+        right
+            .frequency
+            .cmp(&left.frequency)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    tasks.truncate(max_tasks);
+    tasks
+}
+
+struct Candidate {
+    normalized: String,
+    prompt: String,
+    session_id: String,
+    tokens: HashSet<String>,
 }
 
 struct Cluster {
     title: String,
     prompt: String,
-    sessions: Vec<String>,
+    sessions: BTreeSet<String>,
     count: usize,
     tokens: HashSet<String>,
 }
 
-fn normalize(s: &str) -> String {
-    let s = s.to_lowercase();
-    let s = Regex::new(r"\s+").unwrap().replace_all(&s, " ");
-    let s = Regex::new(r"https?://\S+")
-        .unwrap()
-        .replace_all(&s, "<url>");
-    let s = Regex::new(r"/[\w./-]+").unwrap().replace_all(&s, "<path>");
-    let s = Regex::new(r"\b[0-9a-f]{7,}\b")
-        .unwrap()
-        .replace_all(&s, "<id>");
-    s.trim().to_string()
-}
-
-fn significant_tokens(norm: &str) -> HashSet<String> {
-    const STOP_WORDS: [&str; 12] = [
-        "the", "a", "an", "to", "of", "and", "in", "for", "on", "please", "can", "you",
-    ];
-    norm.split_whitespace()
-        .map(|token| token.trim_matches(|c: char| !c.is_alphanumeric()))
-        .filter(|token| token.len() > 2 && !STOP_WORDS.contains(token))
-        .take(24)
-        .map(str::to_owned)
-        .collect()
-}
-
-fn token_similarity(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
-    let intersection = left.intersection(right).count();
-    let union = left.len() + right.len() - intersection;
-    if union == 0 {
-        0.0
-    } else {
-        intersection as f64 / union as f64
-    }
+fn representative_should_change(existing: &str, incoming: &str) -> bool {
+    let existing_length = existing.chars().count();
+    let incoming_length = incoming.chars().count();
+    incoming_length > existing_length || (incoming_length == existing_length && incoming < existing)
 }
 
 fn titleize(norm: &str) -> String {
@@ -165,5 +157,91 @@ mod tests {
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].frequency, 2);
         assert_eq!(tasks[0].source_session_ids, ["1", "2"]);
+    }
+
+    fn session(id: &str, excerpts: &[&str]) -> SessionSummary {
+        SessionSummary {
+            id: id.into(),
+            path: PathBuf::from(id),
+            title: None,
+            cwd: None,
+            started_at: None,
+            user_turns: excerpts.len(),
+            assistant_turns: 1,
+            tool_calls: 0,
+            user_excerpts: excerpts.iter().map(|excerpt| (*excerpt).into()).collect(),
+        }
+    }
+
+    #[test]
+    fn reordered_sessions_and_excerpts_produce_identical_task_ids_and_order() {
+        let first = vec![
+            session(
+                "session-b",
+                &[
+                    "Document the release rollback procedure carefully",
+                    "Fix login authentication failures in auth module",
+                ],
+            ),
+            session(
+                "session-a",
+                &[
+                    "Fix recurring login authentication failures in auth module",
+                    "Document the release rollback procedure carefully",
+                ],
+            ),
+        ];
+        let second = vec![
+            session(
+                "session-a",
+                &[
+                    "Document the release rollback procedure carefully",
+                    "Fix recurring login authentication failures in auth module",
+                ],
+            ),
+            session(
+                "session-b",
+                &[
+                    "Fix login authentication failures in auth module",
+                    "Document the release rollback procedure carefully",
+                ],
+            ),
+        ];
+
+        let summarize = |tasks: Vec<MinedTask>| {
+            tasks
+                .into_iter()
+                .map(|task| {
+                    (
+                        task.id,
+                        task.prompt,
+                        task.frequency,
+                        task.source_session_ids,
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            summarize(mine_tasks(&first, 10)),
+            summarize(mine_tasks(&second, 10))
+        );
+    }
+
+    #[test]
+    fn normalized_equivalent_representatives_receive_the_same_id() {
+        let first = session(
+            "session-a",
+            &["Fix LOGIN at https://example.com for /Users/me/app id ABCDEF123456"],
+        );
+        let second = session(
+            "session-b",
+            &[" fix login at https://other.test for /tmp/app id deadbeef9999 "],
+        );
+
+        assert_eq!(
+            mine_tasks(&[first], 1)[0].id,
+            mine_tasks(&[second], 1)[0].id
+        );
     }
 }

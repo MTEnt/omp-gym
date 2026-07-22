@@ -1,11 +1,13 @@
 use crate::config::GymConfig;
 use crate::harvest::harvest_sessions;
 use crate::mine::mine_tasks;
-use crate::paths::{atomic_write_json, ensure_private_dir};
+use crate::paths::ensure_private_dir;
 use crate::state::{load_latest_proposal, load_state, save_state};
-use crate::types::{TasksFile, SCHEMA_VERSION};
+use crate::task_store::{load_tasks, merge_tasks, save_tasks};
+use crate::types::ReviewStatus;
 use anyhow::{bail, Result};
 use chrono::Utc;
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 
 #[derive(Debug, Clone)]
@@ -20,7 +22,7 @@ pub struct GymReport {
     pub gym_dir: PathBuf,
 }
 
-/// Harvest + mine + write tasks.json. No skill mutation.
+/// Harvest + mine + merge into tasks.json without changing review decisions.
 pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
     ensure_private_dir(&cfg.gym_dir())?;
     let sessions = harvest_sessions(
@@ -29,20 +31,38 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
         cfg.lookback_hours,
         cfg.max_sessions,
     )?;
-    let tasks = mine_tasks(&sessions, cfg.max_tasks);
-    let task_count = tasks.len();
-
-    let tasks_file = TasksFile {
-        schema_version: SCHEMA_VERSION,
-        generated_at: Utc::now(),
-        project: cfg.project.clone(),
-        tasks,
-    };
-    atomic_write_json(&cfg.tasks_path(), &tasks_file)?;
+    let mined = mine_tasks(&sessions, cfg.max_tasks);
+    let now = Utc::now();
+    let mut tasks_file = load_tasks(&cfg.tasks_path(), &cfg.project)?;
+    let existing_ids: BTreeSet<String> = tasks_file
+        .tasks
+        .iter()
+        .map(|task| task.id.clone())
+        .collect();
+    let approved_ids: BTreeSet<String> = tasks_file
+        .tasks
+        .iter()
+        .filter(|task| task.status == ReviewStatus::Approved)
+        .map(|task| task.id.clone())
+        .collect();
+    tasks_file.tasks = merge_tasks(tasks_file.tasks, mined, now)?;
+    tasks_file.generated_at = now;
+    let new_count = tasks_file
+        .tasks
+        .iter()
+        .filter(|task| !existing_ids.contains(&task.id))
+        .count();
+    let preserved_approved_count = tasks_file
+        .tasks
+        .iter()
+        .filter(|task| task.status == ReviewStatus::Approved && approved_ids.contains(&task.id))
+        .count();
+    let task_count = tasks_file.tasks.len();
+    save_tasks(&cfg.tasks_path(), &tasks_file)?;
 
     let mut state = load_state(&cfg.state_path())?;
-    state.last_harvest_at = Some(Utc::now());
-    state.last_session_ids = sessions.iter().map(|s| s.id.clone()).collect();
+    state.last_harvest_at = Some(now);
+    state.last_session_ids = sessions.iter().map(|session| session.id.clone()).collect();
     save_state(&cfg.state_path(), &state)?;
 
     let mut notes = vec![
@@ -52,9 +72,12 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
             cfg.sessions_root.display()
         ),
         format!(
-            "Mined {} task(s) → {}",
+            "Mined and merged {} task(s) → {}",
             task_count,
             cfg.tasks_path().display()
+        ),
+        format!(
+            "Task store: {new_count} new, {preserved_approved_count} preserved approved, {task_count} total"
         ),
         "No skill files were modified.".into(),
     ];
@@ -193,6 +216,7 @@ pub fn adopt(cfg: &GymConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::{CheckSpec, ReviewStatus, TasksFile};
     use std::time::{SystemTime, UNIX_EPOCH};
     use tempfile::tempdir;
 
@@ -264,6 +288,67 @@ mod tests {
     }
 
     #[test]
+    fn dry_run_preserves_approved_tasks_and_checks_across_reharvest() {
+        let root = tempdir().expect("create temporary directory");
+        let project = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::create_dir_all(&sessions).expect("create sessions root");
+        write_session(
+            &sessions.join("selected.jsonl"),
+            "selected",
+            &project,
+            "Fix recurring login authentication failures in the auth module",
+        );
+
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.sessions_root = sessions;
+        config.lookback_hours = 0;
+        dry_run(&config).expect("initial dry run");
+
+        let mut tasks =
+            crate::task_store::load_tasks(&config.tasks_path(), &project).expect("load tasks");
+        assert!(tasks.tasks[0].first_seen_at <= tasks.tasks[0].last_seen_at);
+        let task_id = tasks.tasks[0].id.clone();
+        crate::task_store::approve_task(
+            &mut tasks,
+            &task_id,
+            vec![CheckSpec::Contains {
+                value: "resolved".into(),
+                case_sensitive: false,
+            }],
+            Some("Explain the fix".into()),
+            Some("owner reviewed".into()),
+        )
+        .expect("approve task");
+        crate::task_store::save_tasks(&config.tasks_path(), &tasks).expect("save reviewed tasks");
+
+        let report = dry_run(&config).expect("repeat dry run");
+        let tasks =
+            crate::task_store::load_tasks(&config.tasks_path(), &project).expect("reload tasks");
+
+        assert_eq!(tasks.tasks.len(), 1);
+        assert_eq!(tasks.tasks[0].id, task_id);
+        assert_eq!(tasks.tasks[0].status, ReviewStatus::Approved);
+        assert_eq!(
+            tasks.tasks[0].checks,
+            [CheckSpec::Contains {
+                value: "resolved".into(),
+                case_sensitive: false,
+            }]
+        );
+        assert_eq!(tasks.tasks[0].rubric.as_deref(), Some("Explain the fix"));
+        assert_eq!(
+            tasks.tasks[0].review_note.as_deref(),
+            Some("owner reviewed")
+        );
+        assert!(report
+            .notes
+            .iter()
+            .any(|note| note == "Task store: 0 new, 1 preserved approved, 1 total"));
+    }
+
+    #[test]
     fn dry_run_gitignores_transcript_derived_artifacts() {
         let root = unique_test_dir("artifact-ignore");
         let project = root.join("project");
@@ -301,7 +386,12 @@ mod tests {
                     .permissions()
                     .mode()
                     & 0o777;
-                assert_eq!(mode, expected_mode, "unexpected mode for {}", path.display());
+                assert_eq!(
+                    mode,
+                    expected_mode,
+                    "unexpected mode for {}",
+                    path.display()
+                );
             }
         }
 
