@@ -19,6 +19,7 @@ similar.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+unicode-casefold.workspace = true
 uuid.workspace = true
 walkdir.workspace = true
 wait-timeout.workspace = true

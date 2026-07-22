@@ -5,9 +5,11 @@ use anyhow::{bail, Context, Result};
 use regex::Regex;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
+use unicode_casefold::UnicodeCaseFold;
 
 const SCORE_EPSILON: f64 = 1e-9;
 const SPLIT_DOMAIN: &[u8] = b"omp-gym-split-v1\0";
+const SCORE_VALIDATION_EPSILON: f64 = 1e-12;
 
 pub fn validate_check(check: &CheckSpec) -> Result<()> {
     match check {
@@ -31,6 +33,12 @@ pub fn validate_check(check: &CheckSpec) -> Result<()> {
 pub fn score_trajectory(task: &MinedTask, trajectory: &Trajectory) -> TaskScore {
     let final_text = trajectory.final_text.as_deref().unwrap_or_default();
     let mut reasons = Vec::new();
+    if trajectory.task_id.as_deref() != Some(task.id.as_str()) {
+        reasons.push("trajectory is not the requested validation replay".to_owned());
+    }
+    if trajectory.role != crate::types::ModelRole::Replay {
+        reasons.push("trajectory role is not a validation replay".to_owned());
+    }
     if !trajectory.process_success {
         reasons.push("trajectory process failed".to_owned());
     }
@@ -50,7 +58,6 @@ pub fn score_trajectory(task: &MinedTask, trajectory: &Trajectory) -> TaskScore 
     if trajectory.error.is_some() {
         reasons.push("trajectory reported an error".to_owned());
     }
-    let invariants_passed = reasons.is_empty();
 
     let mut check_results = Vec::with_capacity(task.checks.len());
     for (index, check) in task.checks.iter().enumerate() {
@@ -67,6 +74,7 @@ pub fn score_trajectory(task: &MinedTask, trajectory: &Trajectory) -> TaskScore 
             detail,
         });
     }
+    let invariants_passed = reasons.is_empty();
 
     let passed_checks = check_results.iter().filter(|result| result.passed).count();
     let total_checks = check_results.len();
@@ -120,12 +128,33 @@ fn contains(text: &str, value: &str, case_sensitive: bool) -> bool {
     if case_sensitive {
         text.contains(value)
     } else {
-        text.to_lowercase().contains(&value.to_lowercase())
+        text.case_fold()
+            .collect::<String>()
+            .contains(&value.case_fold().collect::<String>())
     }
 }
 
 fn outcome_detail(kind: &str, passed: bool) -> String {
     format!("{kind} check {}", if passed { "passed" } else { "failed" })
+}
+
+fn diagnostic_id(id: &str) -> String {
+    const MAX_BYTES: usize = 64;
+    let mut escaped = String::with_capacity(MAX_BYTES + 3);
+    let mut truncated = false;
+    for character in id.chars() {
+        let escaped_character = character.escape_default();
+        let piece_len = escaped_character.clone().count();
+        if escaped.len() + piece_len > MAX_BYTES {
+            truncated = true;
+            break;
+        }
+        escaped.extend(escaped_character);
+    }
+    if truncated {
+        escaped.push_str("...");
+    }
+    escaped
 }
 
 pub fn split_tasks(
@@ -150,7 +179,10 @@ pub fn split_tasks(
     let mut ranked = Vec::with_capacity(tasks.len());
     for task in tasks {
         if !ids.insert(task.id.as_str()) {
-            bail!("duplicate task ID in split input: {}", task.id);
+            bail!(
+                "duplicate task ID in split input: {}",
+                diagnostic_id(&task.id)
+            );
         }
         let mut hasher = Sha256::new();
         hasher.update(SPLIT_DOMAIN);
@@ -190,9 +222,6 @@ pub fn split_tasks(
 pub fn gate(baseline: &[TaskScore], candidate: &[TaskScore], min_delta: f64) -> GateDecision {
     let mut reasons = Vec::new();
     let mut regressions = Vec::new();
-    let baseline_mean = finite_mean(baseline, "baseline", &mut reasons);
-    let candidate_mean = finite_mean(candidate, "candidate", &mut reasons);
-    let delta = candidate_mean - baseline_mean;
 
     if !min_delta.is_finite() || min_delta < 0.0 {
         reasons.push("min_delta must be finite and non-negative".to_owned());
@@ -201,6 +230,11 @@ pub fn gate(baseline: &[TaskScore], candidate: &[TaskScore], min_delta: f64) -> 
         reasons.push("gate requires at least one baseline and candidate task score".to_owned());
     }
 
+    validate_scores(baseline, "baseline", &mut reasons);
+    validate_scores(candidate, "candidate", &mut reasons);
+    let baseline_mean = derived_mean(baseline);
+    let candidate_mean = derived_mean(candidate);
+    let delta = candidate_mean - baseline_mean;
     let baseline_by_id = scores_by_id(baseline, "baseline", &mut reasons);
     let candidate_by_id = scores_by_id(candidate, "candidate", &mut reasons);
     if baseline_by_id.keys().ne(candidate_by_id.keys()) {
@@ -208,12 +242,18 @@ pub fn gate(baseline: &[TaskScore], candidate: &[TaskScore], min_delta: f64) -> 
     }
     for (task_id, score) in &baseline_by_id {
         if !score.invariants_passed {
-            reasons.push(format!("baseline task {task_id} invariants failed"));
+            reasons.push(format!(
+                "baseline task {} invariants failed",
+                diagnostic_id(task_id)
+            ));
         }
     }
     for (task_id, score) in &candidate_by_id {
         if !score.invariants_passed {
-            reasons.push(format!("candidate task {task_id} invariants failed"));
+            reasons.push(format!(
+                "candidate task {} invariants failed",
+                diagnostic_id(task_id)
+            ));
         }
     }
 
@@ -222,10 +262,12 @@ pub fn gate(baseline: &[TaskScore], candidate: &[TaskScore], min_delta: f64) -> 
         let Some(candidate_score) = candidate_by_id.get(task_id) else {
             continue;
         };
-        if candidate_score.score + SCORE_EPSILON < baseline_score.score {
+        let task_id = diagnostic_id(task_id);
+        let baseline_derived = derived_score(baseline_score);
+        let candidate_derived = derived_score(candidate_score);
+        if candidate_derived + SCORE_EPSILON < baseline_derived {
             regressions.push(format!(
-                "task {task_id} regressed: score {:.6} -> {:.6}",
-                baseline_score.score, candidate_score.score
+                "task {task_id} regressed: score {baseline_derived:.6} -> {candidate_derived:.6}"
             ));
         }
         if baseline_score.invariants_passed && !candidate_score.invariants_passed {
@@ -271,6 +313,10 @@ pub fn gate(baseline: &[TaskScore], candidate: &[TaskScore], min_delta: f64) -> 
     if improved_checks == 0 {
         reasons.push("candidate must turn at least one failed check into a pass".to_owned());
     }
+    reasons.sort_unstable();
+    reasons.dedup();
+    regressions.sort_unstable();
+    regressions.dedup();
 
     GateDecision {
         accepted: reasons.is_empty() && regressions.is_empty(),
@@ -283,25 +329,76 @@ pub fn gate(baseline: &[TaskScore], candidate: &[TaskScore], min_delta: f64) -> 
     }
 }
 
-fn finite_mean(scores: &[TaskScore], label: &str, reasons: &mut Vec<String>) -> f64 {
+fn validate_scores(scores: &[TaskScore], label: &str, reasons: &mut Vec<String>) {
+    for score in scores {
+        validate_task_score(score, label, reasons);
+    }
+}
+
+fn derived_mean(scores: &[TaskScore]) -> f64 {
     let mut ordered = scores.iter().collect::<Vec<_>>();
     ordered.sort_unstable_by(|left, right| {
         left.task_id
             .cmp(&right.task_id)
+            .then_with(|| derived_score(left).total_cmp(&derived_score(right)))
             .then_with(|| left.score.total_cmp(&right.score))
     });
     let mut mean = 0.0;
     for (index, score) in ordered.into_iter().enumerate() {
-        if !score.score.is_finite() || !(0.0..=1.0).contains(&score.score) {
-            reasons.push(format!(
-                "{label} task {} score must be finite and between 0 and 1",
-                score.task_id
-            ));
-            return 0.0;
-        }
-        mean += (score.score - mean) / (index + 1) as f64;
+        let derived = derived_score(score);
+        mean += (derived - mean) / (index + 1) as f64;
     }
     mean
+}
+
+fn validate_task_score(score: &TaskScore, label: &str, reasons: &mut Vec<String>) {
+    let actual_passed = score
+        .check_results
+        .iter()
+        .filter(|result| result.passed)
+        .count();
+    let mut invalid = |detail: &str| {
+        reasons.push(format!(
+            "{label} task {} is invalid: {detail}",
+            diagnostic_id(&score.task_id)
+        ));
+    };
+
+    if !score.score.is_finite() || !(0.0..=1.0).contains(&score.score) {
+        invalid("score must be finite and between 0 and 1");
+    }
+    if score.total_checks == 0 {
+        invalid("total_checks must be nonzero");
+    }
+    if score.total_checks != score.check_results.len() {
+        invalid("total_checks does not match check results");
+    }
+    if score.passed_checks != actual_passed {
+        invalid("passed_checks does not match check results");
+    }
+    if score
+        .check_results
+        .iter()
+        .any(|result| validate_check(&result.check).is_err())
+    {
+        invalid("contains an invalid check");
+    }
+    let expected = derived_score(score);
+    if !score.score.is_finite() || (score.score - expected).abs() > SCORE_VALIDATION_EPSILON {
+        invalid("score does not match deterministic check results");
+    }
+}
+
+fn derived_score(score: &TaskScore) -> f64 {
+    if !score.invariants_passed || score.check_results.is_empty() {
+        return 0.0;
+    }
+    let passed = score
+        .check_results
+        .iter()
+        .filter(|result| result.passed)
+        .count();
+    passed as f64 / score.check_results.len() as f64
 }
 
 fn scores_by_id<'a>(
@@ -312,7 +409,10 @@ fn scores_by_id<'a>(
     let mut by_id = BTreeMap::new();
     for score in scores {
         if by_id.insert(score.task_id.as_str(), score).is_some() {
-            reasons.push(format!("duplicate {label} task ID: {}", score.task_id));
+            reasons.push(format!(
+                "duplicate {label} task ID: {}",
+                diagnostic_id(&score.task_id)
+            ));
         }
     }
     by_id
@@ -514,6 +614,81 @@ mod tests {
     }
 
     #[test]
+    fn caseless_checks_use_full_default_unicode_folding() {
+        let checks = vec![
+            CheckSpec::Contains {
+                value: "STRASSE".into(),
+                case_sensitive: false,
+            },
+            CheckSpec::Contains {
+                value: "οσ".into(),
+                case_sensitive: false,
+            },
+            CheckSpec::NotContains {
+                value: "STRASSE".into(),
+                case_sensitive: false,
+            },
+            CheckSpec::NotContains {
+                value: "Ος".into(),
+                case_sensitive: false,
+            },
+        ];
+        let scored = score_trajectory(
+            &task("task", checks),
+            &trajectory("task", Some("Straße ΟΣ")),
+        );
+        assert_eq!(
+            scored
+                .check_results
+                .iter()
+                .map(|result| result.passed)
+                .collect::<Vec<_>>(),
+            vec![true, true, false, false]
+        );
+    }
+
+    #[test]
+    fn scoring_requires_matching_task_id_and_replay_role() {
+        let check = CheckSpec::Exact { value: "done".into() };
+        let mut missing_id = trajectory("task", Some("done"));
+        missing_id.task_id = None;
+        let mut wrong_id = trajectory("task", Some("done"));
+        wrong_id.task_id = Some("other-task".into());
+        let mut judge = trajectory("task", Some("done"));
+        judge.role = ModelRole::Judge;
+
+        for invalid in [missing_id, wrong_id, judge] {
+            let scored = score_trajectory(&task("task", vec![check.clone()]), &invalid);
+            assert!(!scored.invariants_passed);
+            assert_eq!(scored.score, 0.0);
+            assert_eq!(scored.passed_checks, 1);
+            assert!(scored.reasons.iter().all(|reason| reason.len() <= 160));
+            assert!(scored
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("validation replay")));
+            assert!(scored
+                .reasons
+                .iter()
+                .all(|reason| !reason.contains("other-task")));
+        }
+    }
+
+    #[test]
+    fn invalid_check_invalidates_an_otherwise_passing_suite() {
+        let checks = vec![
+            CheckSpec::Exact { value: "done".into() },
+            CheckSpec::Regex { pattern: "[".into() },
+        ];
+        let scored =
+            score_trajectory(&task("task", checks), &trajectory("task", Some("done")));
+        assert!(!scored.invariants_passed);
+        assert_eq!(scored.passed_checks, 1);
+        assert_eq!(scored.total_checks, 2);
+        assert_eq!(scored.score, 0.0);
+    }
+
+    #[test]
     fn invariant_failures_force_zero_but_preserve_textual_results() {
         let check = CheckSpec::Contains {
             value: "done".into(),
@@ -678,17 +853,38 @@ mod tests {
 
     #[test]
     fn gate_rejects_mean_delta_miss_and_requires_a_new_check_pass() {
-        let check = CheckSpec::Exact { value: "ok".into() };
-        let baseline = vec![task_score("task", 0.5, true, vec![result(check.clone(), false)])];
-        let candidate = vec![task_score("task", 0.6, true, vec![result(check.clone(), true)])];
-        let miss = gate(&baseline, &candidate, 0.2);
+        let checks = (0..10)
+            .map(|index| CheckSpec::Exact {
+                value: index.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let baseline_results = checks
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, check)| result(check, index < 5))
+            .collect::<Vec<_>>();
+        let candidate_results = checks
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, check)| result(check, index < 6))
+            .collect::<Vec<_>>();
+        let miss = gate(
+            &[task_score("task", 0.5, true, baseline_results)],
+            &[task_score("task", 0.6, true, candidate_results)],
+            0.2,
+        );
         assert!(!miss.accepted);
         assert!(miss.reasons.iter().any(|reason| reason.contains("below required")));
 
+        let a = CheckSpec::Exact { value: "a".into() };
+        let b = CheckSpec::Exact { value: "b".into() };
+        let unchanged = vec![result(a, true), result(b, false)];
         let no_new_pass = gate(
-            &[task_score("task", 0.5, true, vec![result(check.clone(), true)])],
-            &[task_score("task", 0.6, true, vec![result(check, true)])],
-            0.1,
+            &[task_score("task", 0.5, true, unchanged.clone())],
+            &[task_score("task", 0.5, true, unchanged)],
+            0.0,
         );
         assert!(!no_new_pass.accepted);
         assert_eq!(no_new_pass.improved_checks, 0);
@@ -700,23 +896,38 @@ mod tests {
         let a = CheckSpec::Exact { value: "a".into() };
         let b = CheckSpec::Exact { value: "b".into() };
 
+        let score_checks = (0..10)
+            .map(|index| CheckSpec::Exact {
+                value: index.to_string(),
+            })
+            .collect::<Vec<_>>();
+        let baseline_results = score_checks
+            .iter()
+            .cloned()
+            .enumerate()
+            .map(|(index, check)| result(check, index < 8))
+            .collect::<Vec<_>>();
+        let candidate_results = score_checks
+            .into_iter()
+            .enumerate()
+            .map(|(index, check)| result(check, index < 6 || index == 8))
+            .collect::<Vec<_>>();
         let score_regression = gate(
-            &[task_score("task", 0.8, true, vec![result(a.clone(), false)])],
-            &[task_score("task", 0.7, true, vec![result(a.clone(), true)])],
+            &[task_score("task", 0.8, true, baseline_results)],
+            &[task_score("task", 0.7, true, candidate_results)],
             0.0,
         );
         assert!(!score_regression.accepted);
-        assert_eq!(
-            score_regression.regressions,
-            vec!["task task regressed: score 0.800000 -> 0.700000"]
-        );
+        assert!(score_regression
+            .regressions
+            .contains(&"task task regressed: score 0.800000 -> 0.700000".to_owned()));
         assert!(score_regression
             .reasons
-            .contains(&score_regression.regressions[0]));
+            .contains(&"task task regressed: score 0.800000 -> 0.700000".to_owned()));
 
         let invariant_regression = gate(
             &[task_score("task", 0.0, true, vec![result(a.clone(), false)])],
-            &[task_score("task", 1.0, false, vec![result(a.clone(), true)])],
+            &[task_score("task", 0.0, false, vec![result(a.clone(), true)])],
             0.0,
         );
         assert!(!invariant_regression.accepted);
@@ -762,6 +973,90 @@ mod tests {
     }
 
     #[test]
+    fn gate_derives_scores_and_rejects_inconsistent_serialized_scores() {
+        let check = CheckSpec::Exact { value: "ok".into() };
+        let baseline = vec![
+            task_score("forged", 0.0, true, vec![result(check.clone(), false)]),
+            task_score("genuine", 0.0, true, vec![result(check.clone(), false)]),
+        ];
+        let genuine = task_score("genuine", 1.0, true, vec![result(check.clone(), true)]);
+        let mut variants = Vec::new();
+
+        variants.push(task_score(
+            "forged",
+            1.0,
+            true,
+            vec![result(check.clone(), false)],
+        ));
+
+        let mut wrong_total =
+            task_score("forged", 0.0, true, vec![result(check.clone(), false)]);
+        wrong_total.total_checks = 2;
+        variants.push(wrong_total);
+
+        let mut wrong_passed =
+            task_score("forged", 0.0, true, vec![result(check.clone(), false)]);
+        wrong_passed.passed_checks = 1;
+        variants.push(wrong_passed);
+
+        variants.push(task_score(
+            "forged",
+            0.0,
+            true,
+            vec![result(CheckSpec::Exact { value: String::new() }, false)],
+        ));
+
+        variants.push(task_score(
+            "forged",
+            1.0,
+            false,
+            vec![result(check, true)],
+        ));
+
+        for forged in variants {
+            let decision = gate(&baseline, &[forged, genuine.clone()], 0.75);
+            assert!(!decision.accepted, "{decision:?}");
+            assert!(decision
+                .reasons
+                .iter()
+                .any(|reason| reason.contains("candidate task forged is invalid")));
+        }
+
+        let inflated = task_score(
+            "forged",
+            1.0,
+            true,
+            vec![result(CheckSpec::Exact { value: "ok".into() }, false)],
+        );
+        let decision = gate(&baseline, &[inflated, genuine], 0.75);
+        assert_eq!(decision.candidate_mean, 0.5);
+        assert!(!decision.accepted);
+    }
+
+    #[test]
+    fn gate_rejects_reordered_check_sequences() {
+        let a = CheckSpec::Exact { value: "a".into() };
+        let b = CheckSpec::Exact { value: "b".into() };
+        let baseline = vec![task_score(
+            "task",
+            0.5,
+            true,
+            vec![result(a.clone(), true), result(b.clone(), false)],
+        )];
+        let candidate = vec![task_score(
+            "task",
+            1.0,
+            true,
+            vec![result(b, true), result(a, true)],
+        )];
+        let decision = gate(&baseline, &candidate, 0.0);
+        assert!(!decision.accepted);
+        assert!(decision
+            .reasons
+            .contains(&"task task check results are not aligned".to_owned()));
+    }
+
+    #[test]
     fn gate_rejects_empty_mismatched_duplicate_or_misaligned_inputs() {
         let check = CheckSpec::Exact { value: "ok".into() };
         let empty = gate(&[], &[], 0.0);
@@ -798,6 +1093,45 @@ mod tests {
         );
         assert!(!misaligned.accepted);
         assert!(misaligned.reasons.iter().any(|reason| reason.contains("not aligned")));
+    }
+
+    #[test]
+    fn externally_supplied_task_ids_are_escaped_and_bounded_in_diagnostics() {
+        let long_id = format!("unsafe\n{}", "x".repeat(1_000));
+        let duplicate_tasks = vec![
+            task(&long_id, vec![]),
+            task("two", vec![]),
+            task("three", vec![]),
+            task("four", vec![]),
+            task(&long_id, vec![]),
+        ];
+        let split_error = split_tasks(
+            &duplicate_tasks.iter().collect::<Vec<_>>(),
+            0.4,
+            2,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(split_error.len() <= 160, "{split_error:?}");
+        assert!(!split_error.contains('\n'), "{split_error:?}");
+
+        let check = CheckSpec::Exact { value: "ok".into() };
+        let invalid_gate = gate(
+            &[
+                task_score(&long_id, 0.0, true, vec![result(check.clone(), false)]),
+                task_score(&long_id, 0.0, true, vec![result(check.clone(), false)]),
+            ],
+            &[task_score(&long_id, 1.0, true, vec![result(check, true)])],
+            0.0,
+        );
+        assert!(invalid_gate
+            .reasons
+            .iter()
+            .all(|reason| reason.len() <= 160 && !reason.contains('\n')));
+        assert!(invalid_gate
+            .regressions
+            .iter()
+            .all(|reason| reason.len() <= 160 && !reason.contains('\n')));
     }
 
     #[test]
