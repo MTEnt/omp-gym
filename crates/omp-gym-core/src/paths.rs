@@ -4,9 +4,9 @@ use serde::{de::DeserializeOwned, Serialize};
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
 #[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 /// Default OMP agent home: ~/.omp/agent
 pub fn omp_agent_home() -> Result<PathBuf> {

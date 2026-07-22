@@ -442,7 +442,11 @@ mod tests {
             let message = format!("{error:#}");
 
             assert!(message.contains("unsafe proposal ID"), "message: {message}");
-            assert!(!escaped_path.exists(), "escaped path: {}", escaped_path.display());
+            assert!(
+                !escaped_path.exists(),
+                "escaped path: {}",
+                escaped_path.display()
+            );
             assert!(!dir.exists());
             assert!(!dir.join("LATEST").exists());
         }
@@ -454,7 +458,8 @@ mod tests {
         let latest = root.path().join("LATEST");
         let proposal_path = root.path().join("proposal-1.json");
         std::fs::write(&latest, "proposal-1").expect("write latest pointer");
-        atomic_write_json(&proposal_path, &proposal("proposal-2")).expect("write proposal metadata");
+        atomic_write_json(&proposal_path, &proposal("proposal-2"))
+            .expect("write proposal metadata");
 
         let error = load_latest_proposal(root.path())
             .expect_err("proposal metadata ID must match latest pointer");
