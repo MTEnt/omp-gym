@@ -54,29 +54,28 @@ function runGym(args: string[], cwd: string): { code: number; out: string; err: 
 
 function helpText(): string {
   return [
-    "omp-gym — overnight skill gym for OMP",
+    "omp-gym — session harvester/miner prototype for OMP",
     "",
     "Commands:",
     "  /gym status              Show harvest/run/proposal state",
-    "  /gym dry-run             Harvest OMP sessions + mine tasks (no skill changes)",
-    "  /gym run                 Night cycle (v0.1 stages mock proposal)",
-    "  /gym overnight           Schedule daily 02:15 local (macOS launchd)",
-    "  /gym overnight off       Remove schedule",
-    "  /gym adopt               Apply latest staged proposal (refuses mock)",
-    "  /gym doctor              Paths + binary diagnostics",
+    "  /gym dry-run             Harvest this project's OMP sessions and mine tasks",
+    "  /gym run                 Stage mock proposal metadata; does not edit a skill",
+    "  /gym overnight           Schedule daily mock snapshots at 02:15 (macOS)",
+    "  /gym overnight off       Remove the launchd schedule",
+    "  /gym adopt               Reserved; v0.1 refuses all generated mock proposals",
+    "  /gym doctor              Show project, session, and binary paths",
     "  /gym help                This text",
     "",
-    "Optional args after subcommand are forwarded to omp-gym.",
-    "Set OMP_GYM_BIN to override binary path.",
-    "Set target skill: /gym run -- --target-skill ~/.agents/skills/foo/SKILL.md",
+    "No replay, optimization, validation, or skill editing exists in v0.1.",
+    "Set OMP_GYM_BIN to override the binary path.",
   ].join("\n");
 }
 
 export default function gymExtension(pi: ExtensionAPI) {
   pi.registerCommand("gym", {
-    description: "Overnight skill gym (harvest OMP sessions → improve skills)",
+    description: "Harvest project sessions and stage mock gym artifacts",
     handler: async (args, ctx) => {
-      const cwd = process.cwd();
+      const cwd = ctx.cwd;
       const raw = (args ?? "").trim();
       if (!raw || raw === "help" || raw === "-h" || raw === "--help") {
         ctx.ui.notify(helpText(), "info");

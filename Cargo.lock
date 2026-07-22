@@ -337,11 +337,9 @@ name = "omp-gym"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "chrono",
  "clap",
  "directories",
  "omp-gym-core",
- "serde_json",
 ]
 
 [[package]]
@@ -354,7 +352,6 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
- "thiserror",
  "uuid",
  "walkdir",
 ]

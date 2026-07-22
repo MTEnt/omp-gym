@@ -1,12 +1,12 @@
 use crate::types::{MinedTask, SessionSummary};
 use regex::Regex;
-use std::collections::HashMap;
+use std::collections::HashSet;
 use uuid::Uuid;
 
 /// Mine recurring / representative tasks from harvested sessions.
-/// v0.1: normalize user excerpts, cluster by fingerprint, rank by frequency.
+/// v0.1: normalize user excerpts, cluster by token similarity, rank by frequency.
 pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTask> {
-    let mut clusters: HashMap<String, Cluster> = HashMap::new();
+    let mut clusters: Vec<Cluster> = Vec::new();
 
     for session in sessions {
         for excerpt in &session.user_excerpts {
@@ -14,13 +14,24 @@ pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTas
             if norm.len() < 12 {
                 continue;
             }
-            let fp = fingerprint(&norm);
-            let entry = clusters.entry(fp).or_insert_with(|| Cluster {
-                title: titleize(&norm),
-                prompt: excerpt.clone(),
-                sessions: Vec::new(),
-                count: 0,
-            });
+            let tokens = significant_tokens(&norm);
+            if tokens.is_empty() {
+                continue;
+            }
+            let matching_cluster = clusters
+                .iter()
+                .position(|cluster| token_similarity(&cluster.tokens, &tokens) >= 0.7);
+            if matching_cluster.is_none() {
+                clusters.push(Cluster {
+                    title: titleize(&norm),
+                    prompt: excerpt.clone(),
+                    sessions: Vec::new(),
+                    count: 0,
+                    tokens,
+                });
+            }
+            let cluster_index = matching_cluster.unwrap_or(clusters.len() - 1);
+            let entry = &mut clusters[cluster_index];
             entry.count += 1;
             if !entry.sessions.iter().any(|s| s == &session.id) {
                 entry.sessions.push(session.id.clone());
@@ -33,8 +44,12 @@ pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTas
         }
     }
 
-    let mut items: Vec<_> = clusters.into_values().collect();
-    items.sort_by(|a, b| b.count.cmp(&a.count).then(b.prompt.len().cmp(&a.prompt.len())));
+    let mut items = clusters;
+    items.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then(b.prompt.len().cmp(&a.prompt.len()))
+    });
 
     items
         .into_iter()
@@ -55,26 +70,42 @@ struct Cluster {
     prompt: String,
     sessions: Vec<String>,
     count: usize,
+    tokens: HashSet<String>,
 }
 
 fn normalize(s: &str) -> String {
     let s = s.to_lowercase();
     let s = Regex::new(r"\s+").unwrap().replace_all(&s, " ");
-    let s = Regex::new(r"https?://\S+").unwrap().replace_all(&s, "<url>");
+    let s = Regex::new(r"https?://\S+")
+        .unwrap()
+        .replace_all(&s, "<url>");
     let s = Regex::new(r"/[\w./-]+").unwrap().replace_all(&s, "<path>");
-    let s = Regex::new(r"\b[0-9a-f]{7,}\b").unwrap().replace_all(&s, "<id>");
+    let s = Regex::new(r"\b[0-9a-f]{7,}\b")
+        .unwrap()
+        .replace_all(&s, "<id>");
     s.trim().to_string()
 }
 
-fn fingerprint(norm: &str) -> String {
-    // first ~12 significant tokens
-    let stop = ["the", "a", "an", "to", "of", "and", "in", "for", "on", "please", "can", "you"];
-    let tokens: Vec<&str> = norm
-        .split_whitespace()
-        .filter(|t| t.len() > 2 && !stop.contains(t))
-        .take(12)
-        .collect();
-    tokens.join(" ")
+fn significant_tokens(norm: &str) -> HashSet<String> {
+    const STOP_WORDS: [&str; 12] = [
+        "the", "a", "an", "to", "of", "and", "in", "for", "on", "please", "can", "you",
+    ];
+    norm.split_whitespace()
+        .map(|token| token.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|token| token.len() > 2 && !STOP_WORDS.contains(token))
+        .take(24)
+        .map(str::to_owned)
+        .collect()
+}
+
+fn token_similarity(left: &HashSet<String>, right: &HashSet<String>) -> f64 {
+    let intersection = left.intersection(right).count();
+    let union = left.len() + right.len() - intersection;
+    if union == 0 {
+        0.0
+    } else {
+        intersection as f64 / union as f64
+    }
 }
 
 fn titleize(norm: &str) -> String {
@@ -121,7 +152,8 @@ mod tests {
             },
         ];
         let tasks = mine_tasks(&sessions, 5);
-        assert!(!tasks.is_empty());
-        assert!(tasks[0].frequency >= 2 || tasks.len() >= 1);
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].frequency, 2);
+        assert_eq!(tasks[0].source_session_ids, ["1", "2"]);
     }
 }

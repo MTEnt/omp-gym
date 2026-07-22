@@ -11,6 +11,7 @@ use walkdir::WalkDir;
 /// Harvest OMP session JSONL files under sessions_root.
 pub fn harvest_sessions(
     sessions_root: &Path,
+    project: &Path,
     lookback_hours: u64,
     max_sessions: usize,
 ) -> Result<Vec<SessionSummary>> {
@@ -23,6 +24,7 @@ pub fn harvest_sessions(
     } else {
         Some(Utc::now() - Duration::hours(lookback_hours as i64))
     };
+    let project = std::fs::canonicalize(project).unwrap_or_else(|_| project.to_path_buf());
 
     let mut paths: Vec<PathBuf> = WalkDir::new(sessions_root)
         .into_iter()
@@ -52,7 +54,7 @@ pub fn harvest_sessions(
             break;
         }
         match parse_session(&path) {
-            Ok(s) => {
+            Ok(s) if session_belongs_to_project(&s, &project) => {
                 if let (Some(cut), Some(started)) = (cutoff, s.started_at) {
                     if started < cut {
                         continue;
@@ -60,10 +62,20 @@ pub fn harvest_sessions(
                 }
                 out.push(s);
             }
+            Ok(_) => continue,
             Err(_) => continue,
         }
     }
     Ok(out)
+}
+
+fn session_belongs_to_project(session: &SessionSummary, project: &Path) -> bool {
+    let Some(cwd) = session.cwd.as_deref() else {
+        return false;
+    };
+    let cwd = Path::new(cwd);
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    cwd == project || cwd.starts_with(project)
 }
 
 fn parse_session(path: &Path) -> Result<SessionSummary> {
@@ -99,10 +111,7 @@ fn parse_session(path: &Path) -> Result<SessionSummary> {
                 if let Some(sid) = v.get("id").and_then(|x| x.as_str()) {
                     id = sid.to_string();
                 }
-                cwd = v
-                    .get("cwd")
-                    .and_then(|x| x.as_str())
-                    .map(|s| s.to_string());
+                cwd = v.get("cwd").and_then(|x| x.as_str()).map(|s| s.to_string());
                 title = v
                     .get("title")
                     .and_then(|x| x.as_str())
@@ -131,7 +140,8 @@ fn parse_session(path: &Path) -> Result<SessionSummary> {
                     }
                     "assistant" => {
                         assistant_turns += 1;
-                        if let Some(content) = v.pointer("/message/content").and_then(|c| c.as_array())
+                        if let Some(content) =
+                            v.pointer("/message/content").and_then(|c| c.as_array())
                         {
                             for part in content {
                                 if part.get("type").and_then(|t| t.as_str()) == Some("toolCall")
@@ -216,15 +226,8 @@ fn filename_timestamp(path: &Path) -> Option<DateTime<Utc>> {
     // 2026-07-18T16-02-33-255Z_...
     let re = Regex::new(r"^(\d{4}-\d{2}-\d{2}T\d{2})-(\d{2})-(\d{2})").ok()?;
     let caps = re.captures(name)?;
-    let s = format!(
-        "{}:{}:{}Z",
-        &caps[1].replace('T', "T"),
-        &caps[2],
-        &caps[3]
-    );
-    // 2026-07-18T16:02:33Z
-    let normalized = s.replacen(' ', "T", 1);
-    DateTime::parse_from_rfc3339(&normalized)
+    let timestamp = format!("{}:{}:{}Z", &caps[1], &caps[2], &caps[3]);
+    DateTime::parse_from_rfc3339(&timestamp)
         .ok()
         .map(|d| d.with_timezone(&Utc))
 }
@@ -256,13 +259,13 @@ fn truncate(s: &str, max: usize) -> String {
 fn redact(s: &str) -> String {
     // best-effort secret-shaped redaction
     let patterns = [
-        (r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+", "$1=[REDACTED]"),
+        (
+            r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+",
+            "$1=[REDACTED]",
+        ),
         (r"sk-[A-Za-z0-9]{10,}", "sk-[REDACTED]"),
         (r"ghp_[A-Za-z0-9]{20,}", "ghp_[REDACTED]"),
-        (
-            r"[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
-            "[EMAIL]",
-        ),
+        (r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[EMAIL]"),
     ];
     let mut out = s.to_string();
     for (pat, rep) in patterns {
@@ -304,5 +307,11 @@ mod tests {
         assert_eq!(s.user_turns, 1);
         assert!(s.user_excerpts[0].contains("login bug"));
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn redacts_lowercase_email_addresses() {
+        let redacted = redact("Contact owner@example.com before replay");
+        assert_eq!(redacted, "Contact [EMAIL] before replay");
     }
 }

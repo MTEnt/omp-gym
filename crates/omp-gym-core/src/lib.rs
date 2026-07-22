@@ -1,11 +1,10 @@
-//! omp-gym-core — SkillOpt-Sleep-inspired gym loop for OMP skills.
+//! Project-scoped OMP session harvesting and task-mining primitives.
 //!
-//! Pipeline:
-//! harvest OMP sessions → mine recurring tasks → replay → reflect
-//! → validate (held-out gate) → stage → (user) adopt
+//! v0.1 implements the local data-preparation layer: harvest, redact, mine,
+//! status, dry-run, and mock proposal metadata. It does not replay tasks,
+//! optimize a skill, validate a candidate, or apply skill changes.
 //!
-//! v0.1 implements harvest/mine/status/dry-run/stage scaffolding.
-//! Replay/reflect/validate backends land next; mock path works offline.
+//! Planned loop: harvest → review → replay → reflect → validate → stage → adopt.
 
 pub mod config;
 pub mod harvest;

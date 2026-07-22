@@ -13,7 +13,5 @@ path = "src/main.rs"
 [dependencies]
 omp-gym-core.workspace = true
 anyhow.workspace = true
-chrono.workspace = true
 clap.workspace = true
 directories.workspace = true
-serde_json.workspace = true

@@ -26,9 +26,9 @@ pub fn load_state(path: &Path) -> Result<GymState> {
     if !path.exists() {
         return Ok(GymState::default());
     }
-    let raw = std::fs::read_to_string(path)
-        .with_context(|| format!("read state {}", path.display()))?;
-    Ok(serde_json::from_str(&raw).unwrap_or_default())
+    let raw =
+        std::fs::read_to_string(path).with_context(|| format!("read state {}", path.display()))?;
+    serde_json::from_str(&raw).with_context(|| format!("parse state {}", path.display()))
 }
 
 pub fn save_state(path: &Path, state: &GymState) -> Result<()> {
@@ -62,4 +62,25 @@ pub fn load_latest_proposal(dir: &Path) -> Result<Option<StagedProposal>> {
     }
     let raw = std::fs::read_to_string(path)?;
     Ok(Some(serde_json::from_str(&raw)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn load_state_reports_corrupt_json() {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("omp-gym-corrupt-state-{nanos}.json"));
+        std::fs::write(&path, "{not-json").expect("write corrupt state");
+
+        let error = load_state(&path).expect_err("corrupt state must not reset silently");
+        assert!(error.to_string().contains("parse state"));
+
+        std::fs::remove_file(path).ok();
+    }
 }

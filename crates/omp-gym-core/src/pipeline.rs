@@ -1,7 +1,7 @@
 use crate::config::GymConfig;
 use crate::harvest::harvest_sessions;
 use crate::mine::mine_tasks;
-use crate::paths::ensure_dir;
+use crate::paths::ensure_private_dir;
 use crate::state::{load_latest_proposal, load_state, save_proposal, save_state};
 use crate::types::{StagedProposal, TasksFile};
 use anyhow::{bail, Result};
@@ -24,8 +24,13 @@ pub struct GymReport {
 
 /// Harvest + mine + write tasks.json. No skill mutation.
 pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
-    ensure_dir(&cfg.gym_dir())?;
-    let sessions = harvest_sessions(&cfg.sessions_root, cfg.lookback_hours, cfg.max_sessions)?;
+    ensure_private_dir(&cfg.gym_dir())?;
+    let sessions = harvest_sessions(
+        &cfg.sessions_root,
+        &cfg.project,
+        cfg.lookback_hours,
+        cfg.max_sessions,
+    )?;
     let tasks = mine_tasks(&sessions, cfg.max_tasks);
 
     let tasks_file = TasksFile {
@@ -47,8 +52,12 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
             sessions.len(),
             cfg.sessions_root.display()
         ),
-        format!("Mined {} task(s) → {}", tasks.len(), cfg.tasks_path().display()),
-        "dry-run does not stage skill changes.".into(),
+        format!(
+            "Mined {} task(s) → {}",
+            tasks.len(),
+            cfg.tasks_path().display()
+        ),
+        "No skill files were modified.".into(),
     ];
     if cfg.backend != "mock" {
         notes.push(format!(
@@ -57,9 +66,10 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
         ));
     }
     if let Some(skill) = &cfg.target_skill {
-        notes.push(format!("target skill: {}", skill.display()));
-    } else {
-        notes.push("no --target-skill set; adopt will require one later.".into());
+        notes.push(format!(
+            "reserved target skill (not used by v0.1): {}",
+            skill.display()
+        ));
     }
 
     Ok(GymReport {
@@ -74,9 +84,15 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
     })
 }
 
-/// Full night cycle. v0.1: harvest/mine + stage a mock proposal (no live skill edit).
-/// Real replay/reflect/validate backends land next; gate remains conservative.
+/// Harvest/mine and optionally stage mock proposal metadata.
+/// No model runs and no skill file is evaluated or changed.
 pub fn run_night(cfg: &GymConfig, stage: bool) -> Result<GymReport> {
+    if cfg.backend != "mock" {
+        bail!(
+            "backend '{}' is not implemented; use --backend mock for the harvest-only prototype",
+            cfg.backend
+        );
+    }
     let mut report = dry_run(cfg)?;
     if !stage {
         report
@@ -84,13 +100,11 @@ pub fn run_night(cfg: &GymConfig, stage: bool) -> Result<GymReport> {
             .push("run with stage=false completed harvest/mine only.".into());
         return Ok(report);
     }
-
-    if cfg.backend != "mock" {
-        // Keep safe until omp/openai backends exist
-        report.notes.push(format!(
-            "backend={} not fully implemented; staging mock proposal only (no skill mutation).",
-            cfg.backend
-        ));
+    if report.tasks == 0 {
+        bail!(
+            "no tasks were mined for project {}; refusing to stage an empty proposal",
+            cfg.project.display()
+        );
     }
 
     let proposal = StagedProposal {
@@ -101,7 +115,7 @@ pub fn run_night(cfg: &GymConfig, stage: bool) -> Result<GymReport> {
             .clone()
             .unwrap_or_else(|| PathBuf::from("(unset)")),
         summary: format!(
-            "Mock gym night: {} sessions → {} tasks. Replay/reflect/validate backends pending.",
+            "Mock snapshot: {} sessions → {} tasks. Replay, reflection, and validation are not implemented.",
             report.sessions, report.tasks
         ),
         task_count: report.tasks,
@@ -109,8 +123,8 @@ pub fn run_night(cfg: &GymConfig, stage: bool) -> Result<GymReport> {
         mock: true,
         accepted: false,
         notes: vec![
-            "v0.1 stages a review artifact only.".into(),
-            "No SKILL.md changes until a non-mock backend passes the validation gate and you run adopt.".into(),
+            "This proposal contains metadata only; it has no candidate skill edit.".into(),
+            "v0.1 refuses to adopt every generated mock proposal.".into(),
         ],
     };
 
@@ -123,7 +137,9 @@ pub fn run_night(cfg: &GymConfig, stage: bool) -> Result<GymReport> {
 
     report.staged = true;
     report.proposal_id = Some(proposal.id);
-    report.notes.push(format!("Staged proposal → {}", path.display()));
+    report
+        .notes
+        .push(format!("Staged proposal → {}", path.display()));
     Ok(report)
 }
 
@@ -142,7 +158,7 @@ pub fn status(cfg: &GymConfig) -> Result<String> {
                 .map(|p| p.display().to_string())
                 .unwrap_or_else(|| "(unset)".into())
         ),
-        format!("nights:      {}", state.nights_completed),
+        format!("mock runs:   {}", state.nights_completed),
         format!(
             "last harvest:{}",
             state
@@ -204,4 +220,135 @@ pub fn adopt(cfg: &GymConfig) -> Result<String> {
         proposal.id,
         target.display()
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("omp-gym-{name}-{nanos}"))
+    }
+
+    fn write_session(path: &std::path::Path, id: &str, cwd: &std::path::Path, prompt: &str) {
+        let session = serde_json::json!({
+            "type": "session",
+            "id": id,
+            "cwd": cwd,
+            "timestamp": "2026-07-23T12:00:00Z"
+        });
+        let message = serde_json::json!({
+            "type": "message",
+            "message": {
+                "role": "user",
+                "content": [{ "type": "text", "text": prompt }]
+            }
+        });
+        std::fs::write(path, format!("{session}\n{message}\n")).expect("write session fixture");
+    }
+
+    #[test]
+    fn dry_run_uses_only_sessions_from_the_selected_project() {
+        let root = unique_test_dir("project-filter");
+        let project = root.join("project");
+        let other_project = root.join("other-project");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::create_dir_all(&other_project).expect("create other project");
+        std::fs::create_dir_all(&sessions).expect("create sessions root");
+        write_session(
+            &sessions.join("selected.jsonl"),
+            "selected",
+            &project,
+            "Fix authentication in the selected project",
+        );
+        write_session(
+            &sessions.join("other.jsonl"),
+            "other",
+            &other_project,
+            "Replace billing in another project",
+        );
+
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.sessions_root = sessions;
+        config.lookback_hours = 0;
+        config.max_sessions = 10;
+        config.max_tasks = 10;
+
+        let report = dry_run(&config).expect("dry run");
+        let tasks: TasksFile = serde_json::from_str(
+            &std::fs::read_to_string(config.tasks_path()).expect("read generated tasks"),
+        )
+        .expect("parse generated tasks");
+
+        assert_eq!(report.sessions, 1);
+        assert_eq!(tasks.tasks.len(), 1);
+        assert_eq!(tasks.tasks[0].source_session_ids, ["selected"]);
+        assert!(tasks.tasks[0].prompt.contains("selected project"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn dry_run_gitignores_transcript_derived_artifacts() {
+        let root = unique_test_dir("artifact-ignore");
+        let project = root.join("project");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::create_dir_all(&sessions).expect("create sessions root");
+        write_session(
+            &sessions.join("selected.jsonl"),
+            "selected",
+            &project,
+            "Review private customer workflow",
+        );
+
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.sessions_root = sessions;
+        config.lookback_hours = 0;
+        dry_run(&config).expect("dry run");
+
+        let ignore = std::fs::read_to_string(config.gym_dir().join(".gitignore"))
+            .expect("gym artifacts should be ignored");
+        assert_eq!(ignore, "*\n!.gitignore\n");
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn run_rejects_unimplemented_backends() {
+        let root = unique_test_dir("backend-gate");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("create project");
+
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.backend = "omp".to_owned();
+        config.sessions_root = root.join("missing-sessions");
+
+        let error = run_night(&config, true).expect_err("omp backend is not implemented");
+        assert!(error.to_string().contains("not implemented"));
+
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn run_does_not_stage_a_proposal_without_tasks() {
+        let root = unique_test_dir("empty-run");
+        let project = root.join("project");
+        std::fs::create_dir_all(&project).expect("create project");
+
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.sessions_root = root.join("missing-sessions");
+
+        let error = run_night(&config, true).expect_err("empty run should not stage");
+        assert!(error.to_string().contains("no tasks"));
+        assert!(!config.proposal_dir().join("LATEST").exists());
+
+        std::fs::remove_dir_all(root).ok();
+    }
 }

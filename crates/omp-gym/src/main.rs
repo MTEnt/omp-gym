@@ -10,18 +10,18 @@ use std::process::Command;
 #[command(
     name = "omp-gym",
     version,
-    about = "Overnight skill gym for OMP (SkillOpt-Sleep inspired, Rust)"
+    about = "Project-scoped OMP session harvester and task-mining prototype"
 )]
 struct Cli {
     /// Project root (default: cwd)
     #[arg(long, global = true, default_value = ".")]
     project: PathBuf,
 
-    /// Skill file to improve (SKILL.md)
+    /// Reserved target skill path; v0.1 never modifies it
     #[arg(long, global = true)]
     target_skill: Option<PathBuf>,
 
-    /// Backend: mock | omp | openai_compatible
+    /// Backend (v0.1 run supports mock only)
     #[arg(long, global = true, default_value = "mock")]
     backend: String,
 
@@ -47,15 +47,15 @@ enum Commands {
     Status,
     /// Harvest + mine only; write tasks.json; stage nothing
     DryRun,
-    /// Full night cycle (v0.1 stages mock proposal)
+    /// Harvest, mine, and stage mock proposal metadata
     Run {
-        /// Do not stage a proposal
+        /// Harvest and mine without staging mock metadata
         #[arg(long)]
         no_stage: bool,
     },
-    /// Apply latest staged proposal (refuses mock in v0.1)
+    /// Reserved for non-mock proposals; v0.1 always refuses
     Adopt,
-    /// Install macOS launchd overnight job (default 02:15 local)
+    /// Schedule daily mock harvest snapshots with macOS launchd
     Schedule {
         #[arg(long, default_value_t = 2)]
         hour: u32,
@@ -167,7 +167,9 @@ fn schedule(cfg: &GymConfig, hour: u32, minute: u32, off: bool) -> Result<()> {
     #[cfg(not(target_os = "macos"))]
     {
         let _ = (cfg, hour, minute, off);
-        anyhow::bail!("schedule is implemented for macOS launchd in v0.1; use cron manually elsewhere");
+        anyhow::bail!(
+            "schedule is implemented for macOS launchd in v0.1; use cron manually elsewhere"
+        );
     }
 
     #[cfg(target_os = "macos")]
@@ -182,7 +184,9 @@ fn schedule(cfg: &GymConfig, hour: u32, minute: u32, off: bool) -> Result<()> {
             .join(format!("{label}.plist"));
 
         if off {
-            let _ = Command::new("launchctl").args(["unload", plist.to_str().unwrap()]).status();
+            let _ = Command::new("launchctl")
+                .args(["unload", plist.to_str().unwrap()])
+                .status();
             if plist.exists() {
                 fs_err_remove(&plist)?;
             }
@@ -199,7 +203,11 @@ fn schedule(cfg: &GymConfig, hour: u32, minute: u32, off: bool) -> Result<()> {
         }
 
         let exe = std::env::current_exe().context("current_exe")?;
-        let project = cfg.project.canonicalize().unwrap_or_else(|_| cfg.project.clone());
+        let project = cfg
+            .project
+            .canonicalize()
+            .unwrap_or_else(|_| cfg.project.clone());
+        omp_gym_core::paths::ensure_private_dir(&cfg.gym_dir())?;
         let log_dir = cfg.gym_dir().join("logs");
         omp_gym_core::paths::ensure_dir(&log_dir)?;
         let stdout = log_dir.join("launchd.out.log");
@@ -266,7 +274,9 @@ fn schedule(cfg: &GymConfig, hour: u32, minute: u32, off: bool) -> Result<()> {
             omp_gym_core::paths::ensure_dir(parent)?;
         }
         std::fs::write(&plist, body).with_context(|| format!("write {}", plist.display()))?;
-        let _ = Command::new("launchctl").args(["unload", plist.to_str().unwrap()]).status();
+        let _ = Command::new("launchctl")
+            .args(["unload", plist.to_str().unwrap()])
+            .status();
         let status = Command::new("launchctl")
             .args(["load", plist.to_str().unwrap()])
             .status()

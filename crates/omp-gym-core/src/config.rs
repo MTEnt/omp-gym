@@ -8,15 +8,14 @@ pub struct GymConfig {
     pub project: PathBuf,
     /// OMP sessions root override
     pub sessions_root: PathBuf,
-    /// Skill file to improve (SKILL.md)
+    /// Reserved skill path recorded in mock metadata; v0.1 never modifies it
     pub target_skill: Option<PathBuf>,
     /// Hours of history to harvest (0 = all, subject to max_sessions)
     pub lookback_hours: u64,
     pub max_sessions: usize,
     pub max_tasks: usize,
-    /// mock | omp | openai_compatible (v0.1: mock fully implemented)
+    /// v0.1 run supports only the offline mock backend
     pub backend: String,
-    pub auto_adopt: bool,
 }
 
 impl GymConfig {
@@ -35,7 +34,6 @@ impl GymConfig {
             max_sessions: 20,
             max_tasks: 10,
             backend: "mock".into(),
-            auto_adopt: false,
         })
     }
 
