@@ -1,0 +1,26 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/omp-gym-core",
+    "crates/omp-gym",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/MTEnt/omp-gym"
+authors = ["MTEnt"]
+
+[workspace.dependencies]
+omp-gym-core = { path = "crates/omp-gym-core" }
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+walkdir = "2"

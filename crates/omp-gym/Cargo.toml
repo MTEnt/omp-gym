@@ -1,0 +1,19 @@
+[package]
+name = "omp-gym"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "CLI for overnight OMP skill gym (/gym)"
+
+[[bin]]
+name = "omp-gym"
+path = "src/main.rs"
+
+[dependencies]
+omp-gym-core.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+directories.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "omp-gym-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "OMP skill gym core: harvest sessions, mine tasks, stage gated skill updates"
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+directories.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+walkdir.workspace = true
