@@ -1,4 +1,5 @@
-use crate::types::{MinedTask, SessionSummary};
+use crate::types::{MinedTask, ReviewStatus, SessionSummary};
+use chrono::Utc;
 use regex::Regex;
 use std::collections::HashSet;
 use uuid::Uuid;
@@ -54,13 +55,22 @@ pub fn mine_tasks(sessions: &[SessionSummary], max_tasks: usize) -> Vec<MinedTas
     items
         .into_iter()
         .take(max_tasks)
-        .map(|c| MinedTask {
-            id: Uuid::new_v4().to_string(),
-            title: c.title,
-            prompt: c.prompt,
-            source_session_ids: c.sessions,
-            frequency: c.count,
-            reviewed: false,
+        .map(|c| {
+            let now = Utc::now();
+            MinedTask {
+                id: Uuid::new_v4().to_string(),
+                title: c.title,
+                prompt: c.prompt,
+                source_session_ids: c.sessions,
+                frequency: c.count,
+                status: ReviewStatus::Pending,
+                checks: Vec::new(),
+                rubric: None,
+                review_note: None,
+                reviewed_at: None,
+                first_seen_at: now,
+                last_seen_at: now,
+            }
         })
         .collect()
 }

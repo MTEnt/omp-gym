@@ -3,7 +3,9 @@ use crate::harvest::harvest_sessions;
 use crate::mine::mine_tasks;
 use crate::paths::ensure_private_dir;
 use crate::state::{load_latest_proposal, load_state, save_proposal, save_state};
-use crate::types::{StagedProposal, TasksFile};
+use crate::types::{
+    GateDecision, ProposalStatus, StagedProposal, TaskSplit, TasksFile, SCHEMA_VERSION,
+};
 use anyhow::{bail, Result};
 use chrono::Utc;
 use std::fs;
@@ -34,9 +36,9 @@ pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
     let tasks = mine_tasks(&sessions, cfg.max_tasks);
 
     let tasks_file = TasksFile {
+        schema_version: SCHEMA_VERSION,
         generated_at: Utc::now(),
         project: cfg.project.clone(),
-        reviewed: false,
         tasks: tasks.clone(),
     };
     fs::write(cfg.tasks_path(), serde_json::to_string_pretty(&tasks_file)?)?;
@@ -108,20 +110,43 @@ pub fn run_night(cfg: &GymConfig, stage: bool) -> Result<GymReport> {
     }
 
     let proposal = StagedProposal {
+        schema_version: SCHEMA_VERSION,
         id: Uuid::new_v4().to_string(),
+        run_id: String::new(),
         created_at: Utc::now(),
+        adopted_at: None,
         target_skill: cfg
             .target_skill
             .clone()
             .unwrap_or_else(|| PathBuf::from("(unset)")),
+        status: ProposalStatus::Accepted,
         summary: format!(
             "Mock snapshot: {} sessions → {} tasks. Replay, reflection, and validation are not implemented.",
             report.sessions, report.tasks
         ),
-        task_count: report.tasks,
-        session_count: report.sessions,
-        mock: true,
-        accepted: false,
+        base_skill_hash: String::new(),
+        candidate_skill_hash: String::new(),
+        task_store_hash: String::new(),
+        split: TaskSplit {
+            train_ids: Vec::new(),
+            validation_ids: Vec::new(),
+        },
+        baseline_scores: Vec::new(),
+        candidate_scores: Vec::new(),
+        gate: GateDecision {
+            accepted: false,
+            baseline_mean: 0.0,
+            candidate_mean: 0.0,
+            delta: 0.0,
+            improved_checks: 0,
+            regressions: Vec::new(),
+            reasons: vec!["mock proposal has not been evaluated".into()],
+        },
+        candidate_path: PathBuf::new(),
+        diff_path: PathBuf::new(),
+        evidence_path: PathBuf::new(),
+        backup_path: None,
+        judge_evidence: Vec::new(),
         notes: vec![
             "This proposal contains metadata only; it has no candidate skill edit.".into(),
             "v0.1 refuses to adopt every generated mock proposal.".into(),
@@ -187,9 +212,9 @@ pub fn status(cfg: &GymConfig) -> Result<String> {
     }
     match proposal {
         Some(p) => {
-            lines.push(format!("proposal:    {} (mock={})", p.id, p.mock));
+            lines.push(format!("proposal:    {} (status={:?})", p.id, p.status));
             lines.push(format!("  summary:   {}", p.summary));
-            lines.push(format!("  accepted:  {}", p.accepted));
+            lines.push(format!("  accepted:  {}", p.gate.accepted));
         }
         None => lines.push("proposal:    none staged".into()),
     }
@@ -201,7 +226,7 @@ pub fn adopt(cfg: &GymConfig) -> Result<String> {
     let Some(proposal) = load_latest_proposal(&cfg.proposal_dir())? else {
         bail!("no staged proposal to adopt");
     };
-    if proposal.mock {
+    if proposal.candidate_path.as_os_str().is_empty() {
         bail!(
             "latest proposal {} is mock-only; refusing to modify SKILL.md. \
              Wait for a real backend night or implement replay/validate first.",
