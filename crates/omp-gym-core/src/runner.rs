@@ -19,7 +19,6 @@ use std::os::unix::process::CommandExt;
 // its wait section avoids cross-child wakeup races while capture remains concurrent.
 static PROCESS_WAIT: Mutex<()> = Mutex::new(());
 
-
 pub struct ModelRequest<'a> {
     pub role: ModelRole,
     pub prompt: &'a str,
@@ -145,10 +144,7 @@ impl ModelRunner for OmpRunner {
                 terminate_process_group(&mut child, child_pid);
                 match child.wait() {
                     Ok(status) => (Some(status), None),
-                    Err(error) => (
-                        None,
-                        Some(format!("reap timed-out OMP process: {error}")),
-                    ),
+                    Err(error) => (None, Some(format!("reap timed-out OMP process: {error}"))),
                 }
             }
             Err(error) => {
@@ -191,7 +187,9 @@ impl ModelRunner for OmpRunner {
             errors.push(format!("stderr capture truncated at {limit} bytes"));
         }
         if timed_out {
-            errors.push(format!("OMP process timed out after {timeout_secs} seconds"));
+            errors.push(format!(
+                "OMP process timed out after {timeout_secs} seconds"
+            ));
         }
         if status.as_ref().is_some_and(|status| !status.success()) && !timed_out {
             errors.push(format!(
@@ -219,8 +217,7 @@ impl ModelRunner for OmpRunner {
         let process_success = status.as_ref().is_some_and(|status| status.success())
             && !timed_out
             && errors.is_empty();
-        let error =
-            (!errors.is_empty()).then(|| bounded_utf8(&errors.join("; "), limit));
+        let error = (!errors.is_empty()).then(|| bounded_utf8(&errors.join("; "), limit));
         Ok(Trajectory {
             schema_version: SCHEMA_VERSION,
             id: format!("trajectory-{}", uuid::Uuid::new_v4()),
@@ -379,8 +376,7 @@ fn parse_events(
                                 .iter()
                                 .rev()
                                 .find(|message| {
-                                    message.get("role").and_then(Value::as_str)
-                                        == Some("assistant")
+                                    message.get("role").and_then(Value::as_str) == Some("assistant")
                                 })
                                 .and_then(terminal_failure)
                         })
@@ -612,7 +608,9 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"
         assert!(trajectory.process_success, "{:?}", trajectory.error);
         assert_eq!(trajectory.final_text.as_deref(), Some("GYM_OK result"));
         assert_eq!(trajectory.model.as_deref(), Some("fixture-model"));
-        assert!(!serde_json::to_string(&trajectory.events).unwrap().contains("abc.def.ghi"));
+        assert!(!serde_json::to_string(&trajectory.events)
+            .unwrap()
+            .contains("abc.def.ghi"));
         assert_eq!(trajectory.task_id, None);
         assert!(!trajectory.prompt_hash.is_empty());
         assert!(!trajectory.skill_hash.is_empty());
@@ -812,7 +810,16 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"
             .collect();
         assert_eq!(
             &args[..8],
-            ["-p", "--mode", "json", "--no-session", "--no-tools", "--no-skills", "--no-extensions", "--no-rules"]
+            [
+                "-p",
+                "--mode",
+                "json",
+                "--no-session",
+                "--no-tools",
+                "--no-skills",
+                "--no-extensions",
+                "--no-rules"
+            ]
         );
         assert_eq!(&args[8..11], ["--no-prewalk", "--no-title", "--cwd"]);
         let cwd = PathBuf::from(&args[11]);
@@ -822,7 +829,14 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"
         let skill = PathBuf::from(&args[15]);
         assert_eq!(
             &args[16..],
-            ["--max-time", "9", "--model", "fixture-optimizer", "--", "--help"]
+            [
+                "--max-time",
+                "9",
+                "--model",
+                "fixture-optimizer",
+                "--",
+                "--help"
+            ]
         );
         assert_eq!(
             std::fs::read_to_string(fake.with_extension("overlay")).unwrap(),
@@ -967,9 +981,8 @@ printf 'éééééééééééééééééééé' >&2
         let mut fast_config = config_with_bin(root.path(), fast.clone());
         fast_config.replay_timeout_secs = 1;
 
-        let slow_run = std::thread::spawn(move || {
-            OmpRunner::new(slow_config).run(&replay_request()).unwrap()
-        });
+        let slow_run =
+            std::thread::spawn(move || OmpRunner::new(slow_config).run(&replay_request()).unwrap());
         for _ in 0..1_000 {
             if slow_marker.exists() {
                 break;
@@ -978,9 +991,8 @@ printf 'éééééééééééééééééééé' >&2
         }
         assert!(slow_marker.exists());
 
-        let fast_run = std::thread::spawn(move || {
-            OmpRunner::new(fast_config).run(&replay_request()).unwrap()
-        });
+        let fast_run =
+            std::thread::spawn(move || OmpRunner::new(fast_config).run(&replay_request()).unwrap());
         std::thread::sleep(Duration::from_millis(500));
         assert!(!fast_marker.exists());
 
@@ -993,8 +1005,7 @@ printf 'éééééééééééééééééééé' >&2
     #[test]
     fn bounds_terminal_text_and_error_after_redaction_expands_them() {
         let secret_tokens = "token=x ".repeat(20);
-        let text_event =
-            serde_json::json!({"type":"agent_end","text":secret_tokens}).to_string();
+        let text_event = serde_json::json!({"type":"agent_end","text":secret_tokens}).to_string();
         let text_limit = text_event.len() + 1;
         let (_, final_text, _, _) = parse_events(&text_event, text_limit, "", "");
         let final_text = final_text.unwrap();

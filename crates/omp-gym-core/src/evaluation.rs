@@ -171,7 +171,10 @@ pub fn split_tasks(
     if min_validation < 2 {
         bail!("minimum validation task count must be at least 2");
     }
-    if tasks.iter().any(|task| task.status != ReviewStatus::Approved) {
+    if tasks
+        .iter()
+        .any(|task| task.status != ReviewStatus::Approved)
+    {
         bail!("task split accepts only approved tasks");
     }
 
@@ -190,11 +193,7 @@ pub fn split_tasks(
         let hash: [u8; 32] = hasher.finalize().into();
         ranked.push((hash, task.id.clone()));
     }
-    ranked.sort_unstable_by(|left, right| {
-        left.0
-            .cmp(&right.0)
-            .then_with(|| left.1.cmp(&right.1))
-    });
+    ranked.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
 
     let ratio_count = (tasks.len() as f64 * validation_ratio).ceil() as usize;
     let validation_count = min_validation.max(ratio_count).min(tasks.len() - 3);
@@ -302,10 +301,7 @@ pub fn gate(baseline: &[TaskScore], candidate: &[TaskScore], min_delta: f64) -> 
     }
     reasons.extend(regressions.iter().cloned());
 
-    if min_delta.is_finite()
-        && min_delta >= 0.0
-        && delta + SCORE_EPSILON < min_delta
-    {
+    if min_delta.is_finite() && min_delta >= 0.0 && delta + SCORE_EPSILON < min_delta {
         reasons.push(format!(
             "mean improvement {delta:.6} is below required {min_delta:.6}"
         ));
@@ -514,7 +510,9 @@ mod tests {
         }
 
         for check in [
-            CheckSpec::Exact { value: " \n".into() },
+            CheckSpec::Exact {
+                value: " \n".into(),
+            },
             CheckSpec::Contains {
                 value: String::new(),
                 case_sensitive: true,
@@ -539,7 +537,10 @@ mod tests {
         let exact = CheckSpec::Exact {
             value: "expected".into(),
         };
-        let scored = score_trajectory(&task("task", vec![exact]), &trajectory("task", Some(" \nexpected\t")));
+        let scored = score_trajectory(
+            &task("task", vec![exact]),
+            &trajectory("task", Some(" \nexpected\t")),
+        );
         assert_eq!(scored.score, 1.0);
 
         let spaced_expected = CheckSpec::Exact {
@@ -577,7 +578,11 @@ mod tests {
             &trajectory("task", Some("a needle appears")),
         );
         assert_eq!(
-            scored.check_results.iter().map(|r| r.passed).collect::<Vec<_>>(),
+            scored
+                .check_results
+                .iter()
+                .map(|r| r.passed)
+                .collect::<Vec<_>>(),
             vec![false, true, true, false]
         );
         assert_eq!(scored.score, 0.5);
@@ -649,7 +654,9 @@ mod tests {
 
     #[test]
     fn scoring_requires_matching_task_id_and_replay_role() {
-        let check = CheckSpec::Exact { value: "done".into() };
+        let check = CheckSpec::Exact {
+            value: "done".into(),
+        };
         let mut missing_id = trajectory("task", Some("done"));
         missing_id.task_id = None;
         let mut wrong_id = trajectory("task", Some("done"));
@@ -677,11 +684,14 @@ mod tests {
     #[test]
     fn invalid_check_invalidates_an_otherwise_passing_suite() {
         let checks = vec![
-            CheckSpec::Exact { value: "done".into() },
-            CheckSpec::Regex { pattern: "[".into() },
+            CheckSpec::Exact {
+                value: "done".into(),
+            },
+            CheckSpec::Regex {
+                pattern: "[".into(),
+            },
         ];
-        let scored =
-            score_trajectory(&task("task", checks), &trajectory("task", Some("done")));
+        let scored = score_trajectory(&task("task", checks), &trajectory("task", Some("done")));
         assert!(!scored.invariants_passed);
         assert_eq!(scored.passed_checks, 1);
         assert_eq!(scored.total_checks, 2);
@@ -719,7 +729,10 @@ mod tests {
             let scored = score_trajectory(&task("task", vec![check.clone()]), &trajectory);
             assert!(!scored.invariants_passed);
             assert_eq!(scored.score, 0.0);
-            assert_eq!(scored.passed_checks, usize::from(trajectory.final_text.as_deref() == Some("done")));
+            assert_eq!(
+                scored.passed_checks,
+                usize::from(trajectory.final_text.as_deref() == Some("done"))
+            );
             assert!(!scored.reasons.is_empty());
             assert!(scored.check_results[0].detail.len() <= 160);
             assert!(!scored.check_results[0].detail.contains("runner failed"));
@@ -762,7 +775,10 @@ mod tests {
             .collect::<Vec<_>>();
         let refs = five.iter().collect::<Vec<_>>();
         for ratio in [f64::NAN, f64::INFINITY, 0.0, 1.0, -0.1, 1.1] {
-            assert!(split_tasks(&refs, ratio, 2).is_err(), "accepted ratio {ratio}");
+            assert!(
+                split_tasks(&refs, ratio, 2).is_err(),
+                "accepted ratio {ratio}"
+            );
         }
         assert!(split_tasks(&refs, 0.4, 0).is_err());
         assert!(split_tasks(&refs, 0.4, 1).is_err());
@@ -786,12 +802,31 @@ mod tests {
             case_sensitive: true,
         };
         let baseline = vec![
-            task_score("one", 0.5, true, vec![result(a.clone(), true), result(b.clone(), false)]),
+            task_score(
+                "one",
+                0.5,
+                true,
+                vec![result(a.clone(), true), result(b.clone(), false)],
+            ),
             task_score("two", 0.0, true, vec![result(a.clone(), false)]),
         ];
         let candidate = vec![
             task_score("two", 1.0, true, vec![result(a, true)]),
-            task_score("one", 0.5, true, vec![result(CheckSpec::Contains { value: "a".into(), case_sensitive: true }, true), result(b, false)]),
+            task_score(
+                "one",
+                0.5,
+                true,
+                vec![
+                    result(
+                        CheckSpec::Contains {
+                            value: "a".into(),
+                            case_sensitive: true,
+                        },
+                        true,
+                    ),
+                    result(b, false),
+                ],
+            ),
         ];
 
         let decision = gate(&baseline, &candidate, 0.4);
@@ -876,7 +911,10 @@ mod tests {
             0.2,
         );
         assert!(!miss.accepted);
-        assert!(miss.reasons.iter().any(|reason| reason.contains("below required")));
+        assert!(miss
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("below required")));
 
         let a = CheckSpec::Exact { value: "a".into() };
         let b = CheckSpec::Exact { value: "b".into() };
@@ -888,7 +926,10 @@ mod tests {
         );
         assert!(!no_new_pass.accepted);
         assert_eq!(no_new_pass.improved_checks, 0);
-        assert!(no_new_pass.reasons.iter().any(|reason| reason.contains("failed check")));
+        assert!(no_new_pass
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("failed check")));
     }
 
     #[test]
@@ -926,21 +967,47 @@ mod tests {
             .contains(&"task task regressed: score 0.800000 -> 0.700000".to_owned()));
 
         let invariant_regression = gate(
-            &[task_score("task", 0.0, true, vec![result(a.clone(), false)])],
-            &[task_score("task", 0.0, false, vec![result(a.clone(), true)])],
+            &[task_score(
+                "task",
+                0.0,
+                true,
+                vec![result(a.clone(), false)],
+            )],
+            &[task_score(
+                "task",
+                0.0,
+                false,
+                vec![result(a.clone(), true)],
+            )],
             0.0,
         );
         assert!(!invariant_regression.accepted);
-        assert!(invariant_regression.regressions.iter().any(|reason| reason.contains("invariants regressed")));
+        assert!(invariant_regression
+            .regressions
+            .iter()
+            .any(|reason| reason.contains("invariants regressed")));
 
         let check_regression = gate(
-            &[task_score("task", 0.5, true, vec![result(a.clone(), true), result(b.clone(), false)])],
-            &[task_score("task", 0.5, true, vec![result(a, false), result(b, true)])],
+            &[task_score(
+                "task",
+                0.5,
+                true,
+                vec![result(a.clone(), true), result(b.clone(), false)],
+            )],
+            &[task_score(
+                "task",
+                0.5,
+                true,
+                vec![result(a, false), result(b, true)],
+            )],
             0.0,
         );
         assert!(!check_regression.accepted);
         assert_eq!(check_regression.improved_checks, 1);
-        assert!(check_regression.regressions.iter().any(|reason| reason.contains("check 0 regressed")));
+        assert!(check_regression
+            .regressions
+            .iter()
+            .any(|reason| reason.contains("check 0 regressed")));
     }
 
     #[test]
@@ -948,12 +1015,22 @@ mod tests {
         let check = CheckSpec::Exact { value: "ok".into() };
         let baseline = vec![
             task_score("recovered", 0.0, false, vec![result(check.clone(), false)]),
-            task_score("still-failed", 0.0, false, vec![result(check.clone(), false)]),
+            task_score(
+                "still-failed",
+                0.0,
+                false,
+                vec![result(check.clone(), false)],
+            ),
             task_score("improved", 0.0, true, vec![result(check.clone(), false)]),
         ];
         let candidate = vec![
             task_score("recovered", 1.0, true, vec![result(check.clone(), true)]),
-            task_score("still-failed", 0.0, false, vec![result(check.clone(), false)]),
+            task_score(
+                "still-failed",
+                0.0,
+                false,
+                vec![result(check.clone(), false)],
+            ),
             task_score("improved", 1.0, true, vec![result(check, true)]),
         ];
 
@@ -989,13 +1066,11 @@ mod tests {
             vec![result(check.clone(), false)],
         ));
 
-        let mut wrong_total =
-            task_score("forged", 0.0, true, vec![result(check.clone(), false)]);
+        let mut wrong_total = task_score("forged", 0.0, true, vec![result(check.clone(), false)]);
         wrong_total.total_checks = 2;
         variants.push(wrong_total);
 
-        let mut wrong_passed =
-            task_score("forged", 0.0, true, vec![result(check.clone(), false)]);
+        let mut wrong_passed = task_score("forged", 0.0, true, vec![result(check.clone(), false)]);
         wrong_passed.passed_checks = 1;
         variants.push(wrong_passed);
 
@@ -1003,15 +1078,15 @@ mod tests {
             "forged",
             0.0,
             true,
-            vec![result(CheckSpec::Exact { value: String::new() }, false)],
+            vec![result(
+                CheckSpec::Exact {
+                    value: String::new(),
+                },
+                false,
+            )],
         ));
 
-        variants.push(task_score(
-            "forged",
-            1.0,
-            false,
-            vec![result(check, true)],
-        ));
+        variants.push(task_score("forged", 1.0, false, vec![result(check, true)]));
 
         for forged in variants {
             let decision = gate(&baseline, &[forged, genuine.clone()], 0.75);
@@ -1064,22 +1139,43 @@ mod tests {
         assert!(empty.baseline_mean.is_finite());
         assert!(empty.candidate_mean.is_finite());
 
-        let baseline = vec![task_score("one", 0.0, true, vec![result(check.clone(), false)])];
+        let baseline = vec![task_score(
+            "one",
+            0.0,
+            true,
+            vec![result(check.clone(), false)],
+        )];
         let mismatch = gate(
             &baseline,
-            &[task_score("two", 1.0, true, vec![result(check.clone(), true)])],
+            &[task_score(
+                "two",
+                1.0,
+                true,
+                vec![result(check.clone(), true)],
+            )],
             0.0,
         );
         assert!(!mismatch.accepted);
-        assert!(mismatch.reasons.iter().any(|reason| reason.contains("ID sets differ")));
+        assert!(mismatch
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("ID sets differ")));
 
         let duplicate = gate(
             &[baseline[0].clone(), baseline[0].clone()],
-            &[task_score("one", 1.0, true, vec![result(check.clone(), true)])],
+            &[task_score(
+                "one",
+                1.0,
+                true,
+                vec![result(check.clone(), true)],
+            )],
             0.0,
         );
         assert!(!duplicate.accepted);
-        assert!(duplicate.reasons.iter().any(|reason| reason.contains("duplicate baseline task ID")));
+        assert!(duplicate
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("duplicate baseline task ID")));
 
         let misaligned = gate(
             &baseline,
@@ -1087,12 +1183,20 @@ mod tests {
                 "one",
                 1.0,
                 true,
-                vec![result(CheckSpec::Exact { value: "different".into() }, true)],
+                vec![result(
+                    CheckSpec::Exact {
+                        value: "different".into(),
+                    },
+                    true,
+                )],
             )],
             0.0,
         );
         assert!(!misaligned.accepted);
-        assert!(misaligned.reasons.iter().any(|reason| reason.contains("not aligned")));
+        assert!(misaligned
+            .reasons
+            .iter()
+            .any(|reason| reason.contains("not aligned")));
     }
 
     #[test]
@@ -1105,13 +1209,9 @@ mod tests {
             task("four", vec![]),
             task(&long_id, vec![]),
         ];
-        let split_error = split_tasks(
-            &duplicate_tasks.iter().collect::<Vec<_>>(),
-            0.4,
-            2,
-        )
-        .unwrap_err()
-        .to_string();
+        let split_error = split_tasks(&duplicate_tasks.iter().collect::<Vec<_>>(), 0.4, 2)
+            .unwrap_err()
+            .to_string();
         assert!(split_error.len() <= 160, "{split_error:?}");
         assert!(!split_error.contains('\n'), "{split_error:?}");
 
@@ -1137,7 +1237,12 @@ mod tests {
     #[test]
     fn gate_rejects_nonfinite_or_negative_thresholds_and_scores() {
         let check = CheckSpec::Exact { value: "ok".into() };
-        let baseline = vec![task_score("task", 0.0, true, vec![result(check.clone(), false)])];
+        let baseline = vec![task_score(
+            "task",
+            0.0,
+            true,
+            vec![result(check.clone(), false)],
+        )];
         let candidate = vec![task_score("task", 1.0, true, vec![result(check, true)])];
         for min_delta in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.1] {
             let decision = gate(&baseline, &candidate, min_delta);

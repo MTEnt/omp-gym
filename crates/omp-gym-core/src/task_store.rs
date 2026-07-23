@@ -1,5 +1,5 @@
-use crate::paths::atomic_write_json;
 use crate::evaluation::validate_check;
+use crate::paths::atomic_write_json;
 use crate::types::{CheckSpec, MinedTask, ReviewStatus, TasksFile, SCHEMA_VERSION};
 use anyhow::{bail, Context, Result};
 use chrono::{DateTime, Utc};

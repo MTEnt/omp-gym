@@ -14,10 +14,7 @@ static REDACTIONS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         ),
         (r"sk-[A-Za-z0-9]{10,}", "sk-[REDACTED]"),
         (r"ghp_[A-Za-z0-9]{20,}", "ghp_[REDACTED]"),
-        (
-            r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
-            "[EMAIL]",
-        ),
+        (r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}", "[EMAIL]"),
         (
             r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
             "[REDACTED PRIVATE KEY]",

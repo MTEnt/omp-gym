@@ -248,7 +248,6 @@ fn is_useful_user_text(s: &str) -> bool {
     true
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

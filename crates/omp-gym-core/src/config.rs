@@ -50,10 +50,13 @@ impl GymConfig {
         let defaults = defaults
             .as_object_mut()
             .context("default gym config must serialize as an object")?;
-        let persisted = persisted
-            .as_object()
-            .with_context(|| format!("gym config JSON root must be an object: {}", path.display()))?;
-        if let Some(version) = persisted.get("schema_version").and_then(|value| value.as_u64()) {
+        let persisted = persisted.as_object().with_context(|| {
+            format!("gym config JSON root must be an object: {}", path.display())
+        })?;
+        if let Some(version) = persisted
+            .get("schema_version")
+            .and_then(|value| value.as_u64())
+        {
             if version != u64::from(SCHEMA_VERSION) {
                 bail!("unsupported gym config schema version {version}");
             }
@@ -222,7 +225,11 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let project = root.path().join("project");
         std::fs::create_dir_all(project.join("skills/demo")).unwrap();
-        std::fs::write(project.join("skills/demo/SKILL.md"), "---\nname: demo\n---\n").unwrap();
+        std::fs::write(
+            project.join("skills/demo/SKILL.md"),
+            "---\nname: demo\n---\n",
+        )
+        .unwrap();
 
         let mut config = GymConfig::load(&project).unwrap();
         config.target_skill = Some(PathBuf::from("skills/demo/SKILL.md"));
@@ -249,16 +256,32 @@ mod tests {
         config.target_skill = Some(PathBuf::from("SKILL.md"));
 
         config.replay_timeout_secs = 0;
-        assert!(config.validate_for_run().unwrap_err().to_string().contains("timeout"));
+        assert!(config
+            .validate_for_run()
+            .unwrap_err()
+            .to_string()
+            .contains("timeout"));
         config.replay_timeout_secs = 60;
         config.validation_ratio = 1.0;
-        assert!(config.validate_for_run().unwrap_err().to_string().contains("validation ratio"));
+        assert!(config
+            .validate_for_run()
+            .unwrap_err()
+            .to_string()
+            .contains("validation ratio"));
         config.validation_ratio = 0.4;
         config.min_score_delta = f64::NAN;
-        assert!(config.validate_for_run().unwrap_err().to_string().contains("score delta"));
+        assert!(config
+            .validate_for_run()
+            .unwrap_err()
+            .to_string()
+            .contains("score delta"));
         config.min_score_delta = 0.05;
         config.max_growth_ratio = 0.5;
-        assert!(config.validate_for_run().unwrap_err().to_string().contains("growth ratio"));
+        assert!(config
+            .validate_for_run()
+            .unwrap_err()
+            .to_string()
+            .contains("growth ratio"));
         config.max_growth_ratio = 1.5;
         config.max_output_bytes = 1;
         assert!(config
