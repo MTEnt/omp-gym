@@ -98,11 +98,15 @@ impl ModelRunner for OmpRunner {
             });
         }
 
+        let wait_guard = PROCESS_WAIT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let started_at = Utc::now();
         let started = Instant::now();
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(_) => {
+                drop(wait_guard);
                 return Ok(Trajectory {
                     schema_version: SCHEMA_VERSION,
                     id: format!("trajectory-{}", uuid::Uuid::new_v4()),
@@ -133,9 +137,6 @@ impl ModelRunner for OmpRunner {
 
         let timeout = Duration::from_secs(timeout_secs);
         let mut timed_out = false;
-        let wait_guard = PROCESS_WAIT
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let (status, wait_error) = match child.wait_timeout(timeout) {
             Ok(Some(status)) => (Some(status), None),
             Ok(None) => {
@@ -213,6 +214,8 @@ impl ModelRunner for OmpRunner {
         let process_success = status.as_ref().is_some_and(|status| status.success())
             && !timed_out
             && errors.is_empty();
+        let error =
+            (!errors.is_empty()).then(|| bounded_utf8(&errors.join("; "), limit));
         Ok(Trajectory {
             schema_version: SCHEMA_VERSION,
             id: format!("trajectory-{}", uuid::Uuid::new_v4()),
@@ -230,7 +233,7 @@ impl ModelRunner for OmpRunner {
             final_text,
             events,
             stderr,
-            error: (!errors.is_empty()).then(|| errors.join("; ")),
+            error,
         })
     }
 }
@@ -346,18 +349,23 @@ fn parse_events(
                     message.get("role").and_then(Value::as_str) == Some("assistant")
                 }) {
                     assistant_message_observed = true;
-                    message_end = message
-                        .get("content")
-                        .and_then(extract_text)
-                        .map(|text| redact_text(&text));
                     message_error = terminal_failure(message);
+                    message_end = message.get("content").and_then(extract_text).map(|text| {
+                        let redacted = redact_text(&text);
+                        if redacted.len() > limit {
+                            message_error = append_diagnostic(
+                                message_error.take(),
+                                format!(
+                                    "terminal assistant text truncated at {limit} bytes after redaction"
+                                ),
+                            );
+                        }
+                        bounded_utf8(&redacted, limit)
+                    });
                 }
             }
             Some("agent_end") => {
-                agent_end = extract_agent_end(&event)
-                    .map(|text| redact_text(&text))
-                    .or(agent_end);
-                agent_error = terminal_failure(&event).or_else(|| {
+                let mut current_error = terminal_failure(&event).or_else(|| {
                     event
                         .get("messages")
                         .and_then(Value::as_array)
@@ -372,6 +380,19 @@ fn parse_events(
                                 .and_then(terminal_failure)
                         })
                 });
+                if let Some(text) = extract_agent_end(&event) {
+                    let redacted = redact_text(&text);
+                    if redacted.len() > limit {
+                        current_error = append_diagnostic(
+                            current_error,
+                            format!(
+                                "terminal assistant text truncated at {limit} bytes after redaction"
+                            ),
+                        );
+                    }
+                    agent_end = Some(bounded_utf8(&redacted, limit));
+                }
+                agent_error = current_error;
             }
             _ => {}
         }
@@ -398,17 +419,34 @@ fn parse_events(
     } else {
         (agent_end, agent_error)
     };
-    let terminal_error =
-        terminal_error.map(|error| sanitize_text_evidence(&error, prompt, skill));
+    let terminal_error = terminal_error.map(|error| {
+        let sanitized = sanitize_text_evidence(&error, prompt, skill);
+        if sanitized.len() > limit {
+            bounded_utf8(
+                &format!("terminal error truncated at {limit} bytes after redaction; {sanitized}"),
+                limit,
+            )
+        } else {
+            sanitized
+        }
+    });
     let event_error = if events_truncated {
-        Some(match terminal_error {
-            Some(error) => format!("{error}; retained events truncated at {limit} bytes"),
-            None => format!("retained events truncated at {limit} bytes"),
-        })
+        append_diagnostic(
+            terminal_error,
+            format!("retained events truncated at {limit} bytes"),
+        )
     } else {
         terminal_error
-    };
+    }
+    .map(|error| bounded_utf8(&error, limit));
     (events, final_text, model, event_error)
+}
+
+fn append_diagnostic(existing: Option<String>, diagnostic: String) -> Option<String> {
+    Some(match existing {
+        Some(existing) => format!("{existing}; {diagnostic}"),
+        None => diagnostic,
+    })
 }
 
 fn sanitize_event_evidence(value: &mut Value, prompt: &str, skill: &str) {
@@ -795,13 +833,12 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"
 printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"complete"}],"stopReason":"stop"}}'
 "#,
         );
-        let started = std::time::Instant::now();
 
         let trajectory = OmpRunner::new(config_with_bin(root.path(), fake))
             .run(&replay_request())
             .unwrap();
 
-        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(trajectory.duration_ms < 5_000);
         assert!(trajectory.process_success, "{:?}", trajectory.error);
     }
 
@@ -824,7 +861,9 @@ printf 'éééééééééééééééééééé' >&2
         assert!(trajectory.stderr.len() <= 17);
         assert!(std::str::from_utf8(trajectory.stderr.as_bytes()).is_ok());
         assert!(serde_json::to_vec(&trajectory.events).unwrap().len() <= 17);
-        assert!(trajectory.error.unwrap().contains("truncated"));
+        let error = trajectory.error.unwrap();
+        assert!(!error.is_empty());
+        assert!(error.len() <= 17);
     }
 
     #[test]
@@ -844,6 +883,77 @@ printf 'éééééééééééééééééééé' >&2
         assert_eq!(trajectory.exit_code, Some(7));
         assert!(trajectory.stderr.contains("fixture failure"));
         assert!(trajectory.error.unwrap().contains("status"));
+    }
+
+    #[test]
+    fn concurrent_replay_does_not_spawn_while_wait_boundary_is_occupied() {
+        let root = tempfile::tempdir().unwrap();
+        let slow = root.path().join("slow-omp");
+        let fast = root.path().join("fast-omp");
+        let slow_marker = PathBuf::from(format!("{}.started", slow.display()));
+        let fast_marker = PathBuf::from(format!("{}.started", fast.display()));
+        write_executable(
+            &slow,
+            "#!/bin/sh\nprintf started > \"$0.started\"\nsleep 10\n",
+        );
+        write_executable(
+            &fast,
+            "#!/bin/sh\nprintf started > \"$0.started\"\nsleep 10\n",
+        );
+        let mut slow_config = config_with_bin(root.path(), slow.clone());
+        slow_config.replay_timeout_secs = 1;
+        let mut fast_config = config_with_bin(root.path(), fast.clone());
+        fast_config.replay_timeout_secs = 1;
+
+        let slow_run = std::thread::spawn(move || {
+            OmpRunner::new(slow_config).run(&replay_request()).unwrap()
+        });
+        for _ in 0..1_000 {
+            if slow_marker.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(slow_marker.exists());
+
+        let fast_run = std::thread::spawn(move || {
+            OmpRunner::new(fast_config).run(&replay_request()).unwrap()
+        });
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(!fast_marker.exists());
+
+        assert!(slow_run.join().unwrap().timed_out);
+        let second = fast_run.join().unwrap();
+        assert!(second.timed_out);
+        assert!(second.duration_ms < 2_000);
+    }
+
+    #[test]
+    fn bounds_terminal_text_and_error_after_redaction_expands_them() {
+        let secret_tokens = "token=x ".repeat(20);
+        let text_event =
+            serde_json::json!({"type":"agent_end","text":secret_tokens}).to_string();
+        let text_limit = text_event.len() + 1;
+        let (_, final_text, _, _) = parse_events(&text_event, text_limit, "", "");
+        let final_text = final_text.unwrap();
+        assert!(final_text.len() <= text_limit);
+        assert!(!final_text.contains("token=x"));
+
+        let error_event = serde_json::json!({
+            "type":"message_end",
+            "message":{
+                "role":"assistant",
+                "content":"ok",
+                "stopReason":"error",
+                "errorMessage":secret_tokens
+            }
+        })
+        .to_string();
+        let error_limit = error_event.len() + 1;
+        let (_, _, _, error) = parse_events(&error_event, error_limit, "", "");
+        let error = error.unwrap();
+        assert!(error.len() <= error_limit);
+        assert!(!error.contains("token=x"));
     }
 
     #[test]
