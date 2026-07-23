@@ -4,9 +4,7 @@ use crate::harvest::harvest_sessions;
 use crate::mine::mine_tasks;
 use crate::paths::ensure_private_dir;
 use crate::state::{load_latest_proposal, load_state, save_state};
-use crate::task_store::{
-    load_tasks, merge_tasks, save_tasks, validate_reviewed_tasks,
-};
+use crate::task_store::{load_tasks, merge_tasks, save_tasks, validate_reviewed_tasks};
 use crate::types::{MinedTask, ReviewStatus, TaskSplit, TasksFile};
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
@@ -58,8 +56,9 @@ impl RunLease {
                     cfg.project.display()
                 )
             }
-            Err(error) => Err(error)
-                .with_context(|| format!("acquire optimizer run lock {}", path.display())),
+            Err(error) => {
+                Err(error).with_context(|| format!("acquire optimizer run lock {}", path.display()))
+            }
         }
     }
 }
@@ -173,8 +172,12 @@ where
         .filter(|task| task.status == ReviewStatus::Approved && approved_ids.contains(&task.id))
         .count();
     let task_count = tasks_file.tasks.len();
-    let task_store_bytes = serde_json::to_vec_pretty(&tasks_file)
-        .with_context(|| format!("serialize refreshed task store {}", cfg.tasks_path().display()))?;
+    let task_store_bytes = serde_json::to_vec_pretty(&tasks_file).with_context(|| {
+        format!(
+            "serialize refreshed task store {}",
+            cfg.tasks_path().display()
+        )
+    })?;
     save_tasks(&cfg.tasks_path(), &tasks_file)?;
 
     state.last_harvest_at = Some(now);
@@ -408,9 +411,7 @@ pub fn adopt(cfg: &GymConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        CheckSpec, MinedTask, ReviewStatus, TaskSplit, TasksFile, SCHEMA_VERSION,
-    };
+    use crate::types::{CheckSpec, MinedTask, ReviewStatus, TaskSplit, TasksFile, SCHEMA_VERSION};
     use chrono::Utc;
     use sha2::{Digest, Sha256};
     use std::collections::BTreeMap;
@@ -880,11 +881,8 @@ mod tests {
         let error = prepare_run(&fixture.config)
             .expect_err("new pending task must not satisfy approved minimum")
             .to_string();
-        let tasks = load_tasks(
-            &fixture.config.tasks_path(),
-            &fixture.config.project,
-        )
-        .expect("load refreshed tasks");
+        let tasks = load_tasks(&fixture.config.tasks_path(), &fixture.config.project)
+            .expect("load refreshed tasks");
 
         assert!(error.contains("at least 5 approved tasks"), "{error}");
         assert_eq!(tasks.tasks.len(), 5);
@@ -989,7 +987,10 @@ mod tests {
         let corrupt_error = prepare_run(&corrupt.config)
             .expect_err("corrupt tasks must fail")
             .to_string();
-        assert!(corrupt_error.contains("parse tasks JSON"), "{corrupt_error}");
+        assert!(
+            corrupt_error.contains("parse tasks JSON"),
+            "{corrupt_error}"
+        );
         assert!(!corrupt.config.runs_dir().exists());
         assert!(!corrupt.config.proposal_dir().join("LATEST").exists());
 
