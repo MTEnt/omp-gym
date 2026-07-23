@@ -1370,14 +1370,14 @@ mod tests {
             BASE_SKILL,
             &exact_split,
             &[training_input(&train, &train_replay)],
-            &[train_score.clone()],
+            std::slice::from_ref(&train_score),
         )
         .unwrap();
         assert!(build_optimizer_prompt(
             BASE_SKILL,
             &exact_split,
             &[training_input(&validation, &validation_replay)],
-            &[validation_score.clone()],
+            std::slice::from_ref(&validation_score),
         )
         .is_err());
         assert!(build_optimizer_prompt(
@@ -1399,7 +1399,7 @@ mod tests {
             BASE_SKILL,
             &missing_train,
             &[training_input(&train, &train_replay)],
-            &[train_score.clone()],
+            std::slice::from_ref(&train_score),
         )
         .is_err());
         for invalid_split in [
@@ -1420,7 +1420,7 @@ mod tests {
                 BASE_SKILL,
                 &invalid_split,
                 &[training_input(&train, &train_replay)],
-                &[train_score.clone()],
+                std::slice::from_ref(&train_score),
             )
             .is_err());
         }
@@ -1467,7 +1467,7 @@ mod tests {
         assert!(build_test_optimizer_prompt(
             BASE_SKILL,
             &[training_input(&pending, &replay)],
-            &[matching_score.clone()]
+            std::slice::from_ref(&matching_score)
         )
         .is_err());
 
@@ -1476,7 +1476,7 @@ mod tests {
         assert!(build_test_optimizer_prompt(
             BASE_SKILL,
             &[training_input(&approved, &wrong_task_replay)],
-            &[matching_score.clone()]
+            std::slice::from_ref(&matching_score)
         )
         .is_err());
 
@@ -1485,7 +1485,7 @@ mod tests {
         assert!(build_test_optimizer_prompt(
             BASE_SKILL,
             &[training_input(&approved, &optimizer_trajectory)],
-            &[matching_score.clone()]
+            std::slice::from_ref(&matching_score)
         )
         .is_err());
 

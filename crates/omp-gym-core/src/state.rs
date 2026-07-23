@@ -475,8 +475,10 @@ mod tests {
     fn save_state_atomically_replaces_complete_document() {
         let root = tempdir().expect("create temporary directory");
         let path = root.path().join("nested").join("state.json");
-        let mut state = GymState::default();
-        state.last_session_ids = vec!["obsolete-session-with-a-long-id".into()];
+        let mut state = GymState {
+            last_session_ids: vec!["obsolete-session-with-a-long-id".into()],
+            ..GymState::default()
+        };
         save_state(&path, &state).expect("write first state");
 
         state.last_session_ids.clear();

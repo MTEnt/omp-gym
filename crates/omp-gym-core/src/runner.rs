@@ -173,7 +173,7 @@ impl ModelRunner for OmpRunner {
         );
         let stderr = bounded_utf8(&stderr, limit);
         let (events, final_text, model, event_error) =
-            parse_events(&stdout, limit, request.prompt, request.skill);
+            parse_events(stdout, limit, request.prompt, request.skill);
 
         let mut errors = Vec::new();
         errors.extend(wait_error);

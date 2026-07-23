@@ -1202,7 +1202,7 @@ mod tests {
     #[test]
     fn externally_supplied_task_ids_are_escaped_and_bounded_in_diagnostics() {
         let long_id = format!("unsafe\n{}", "x".repeat(1_000));
-        let duplicate_tasks = vec![
+        let duplicate_tasks = [
             task(&long_id, vec![]),
             task("two", vec![]),
             task("three", vec![]),
