@@ -1,8 +1,30 @@
 # omp-gym
 
-Rust tooling for a future overnight skill gym for [OMP](https://github.com/MTEnt/oh-my-pi).
+**An evidence-driven prompt gym for [OMP](https://github.com/MTEnt/oh-my-pi).**
 
-Inspired by [microsoft/SkillOpt](https://github.com/microsoft/SkillOpt) (MIT). This is a clean-room Rust project focused on OMP, not a port of SkillOpt's Python package.
+A **prompt gym** is a feedback loop for improving reusable AI instructions from evidence instead of guesswork. It turns real work into representative tasks, measures how the current instructions perform, proposes a bounded improvement, and tests that candidate on tasks it was not trained on. In OMP, those reusable instructions are typically a skill's `SKILL.md` file.
+
+## Why use a prompt gym?
+
+- **Learn from your work.** Improvements come from the projects and tasks where you actually use OMP, not a generic benchmark.
+- **Measure changes repeatably.** Explicit checks make "better" more than a subjective impression.
+- **Reduce overfitting.** Training tasks guide a candidate while held-out tasks independently decide whether it improved.
+- **Keep humans in control.** The gym stages evidence and a reviewable diff; it never needs to rewrite a live skill automatically.
+
+## How it works with OMP
+
+OMP records the sessions where work happens. `omp-gym` is a project-scoped companion that turns those sessions into an improvement loop:
+
+1. **Harvest** OMP sessions that started in the selected project.
+2. **Mine and review** representative tasks and their deterministic success checks.
+3. **Replay a baseline** through OMP using the current skill.
+4. **Generate one bounded candidate** from training-task evidence.
+5. **Validate on held-out tasks** and accept the candidate only when the deterministic gate improves.
+6. **Stage a proposal** containing the candidate `SKILL.md`, diff, scores, and replay evidence for human review and explicit adoption.
+
+This design is inspired by [microsoft/SkillOpt](https://github.com/microsoft/SkillOpt) (MIT), but `omp-gym` is a clean-room Rust project built for OMP rather than a port of SkillOpt's Python package.
+
+> **Implementation boundary:** The workflow above describes the intended complete system. Today's user-facing CLI still stops after session harvesting, task mining, and mock proposal staging. The codebase contains foundational task-review, replay, evaluation, and proposal-safety components, but the CLI does not yet connect them into the full optimization and adoption loop. The status table below is the authoritative list of what users can run now.
 
 ## Current status
 
