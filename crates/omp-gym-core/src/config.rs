@@ -160,6 +160,14 @@ impl GymConfig {
         self.gym_dir().join("proposals")
     }
 
+    pub fn runs_dir(&self) -> PathBuf {
+        self.gym_dir().join("runs")
+    }
+
+    pub fn run_lock_path(&self) -> PathBuf {
+        self.gym_dir().join("run.lock")
+    }
+
     pub fn with_target_skill(mut self, path: impl AsRef<Path>) -> Self {
         self.target_skill = Some(path.as_ref().to_path_buf());
         self

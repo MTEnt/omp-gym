@@ -1,14 +1,23 @@
 use crate::config::GymConfig;
+use crate::evaluation::split_tasks;
 use crate::harvest::harvest_sessions;
 use crate::mine::mine_tasks;
 use crate::paths::ensure_private_dir;
 use crate::state::{load_latest_proposal, load_state, save_state};
-use crate::task_store::{load_tasks, merge_tasks, save_tasks};
-use crate::types::ReviewStatus;
-use anyhow::{bail, Result};
+use crate::task_store::{
+    load_tasks, merge_tasks, save_tasks, validate_reviewed_tasks,
+};
+use crate::types::{MinedTask, ReviewStatus, TaskSplit, TasksFile};
+use anyhow::{bail, Context, Result};
 use chrono::Utc;
+use fs2::FileExt;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::ErrorKind;
+#[cfg(unix)]
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
 pub struct GymReport {
@@ -22,14 +31,112 @@ pub struct GymReport {
     pub gym_dir: PathBuf,
 }
 
-/// Harvest + mine + merge into tasks.json without changing review decisions.
-pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
-    dry_run_with_state_saver(cfg, save_state)
+#[derive(Debug)]
+struct RunLease {
+    _file: File,
 }
 
-fn dry_run_with_state_saver<F>(cfg: &GymConfig, state_saver: F) -> Result<GymReport>
+impl RunLease {
+    fn acquire(cfg: &GymConfig) -> Result<Self> {
+        ensure_private_dir(&cfg.gym_dir())?;
+        let path = cfg.run_lock_path();
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        options.mode(0o600);
+        let file = options
+            .open(&path)
+            .with_context(|| format!("open optimizer run lock {}", path.display()))?;
+        #[cfg(unix)]
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("set optimizer run lock permissions {}", path.display()))?;
+        match file.try_lock_exclusive() {
+            Ok(()) => Ok(Self { _file: file }),
+            Err(error) if error.kind() == ErrorKind::WouldBlock => {
+                bail!(
+                    "optimizer run already in progress for {}",
+                    cfg.project.display()
+                )
+            }
+            Err(error) => Err(error)
+                .with_context(|| format!("acquire optimizer run lock {}", path.display())),
+        }
+    }
+}
+
+/// Validated, stable inputs for an optimizer run.
+///
+/// The exclusive project run lease remains held until this value is dropped.
+/// This preflight context intentionally contains no model output or persisted
+/// run/proposal artifacts.
+#[derive(Debug)]
+pub struct PreparedRun {
+    _lease: RunLease,
+    approved_tasks: Vec<MinedTask>,
+    split: TaskSplit,
+    target_skill: PathBuf,
+    base_skill: String,
+    task_store_hash: String,
+    base_skill_hash: String,
+    session_count: usize,
+    task_count: usize,
+    notes: Vec<String>,
+}
+
+impl PreparedRun {
+    pub fn approved_tasks(&self) -> &[MinedTask] {
+        &self.approved_tasks
+    }
+
+    pub fn approved_task_count(&self) -> usize {
+        self.approved_tasks.len()
+    }
+
+    pub fn split(&self) -> &TaskSplit {
+        &self.split
+    }
+
+    pub fn target_skill(&self) -> &Path {
+        &self.target_skill
+    }
+
+    pub fn base_skill(&self) -> &str {
+        &self.base_skill
+    }
+
+    pub fn task_store_hash(&self) -> &str {
+        &self.task_store_hash
+    }
+
+    pub fn base_skill_hash(&self) -> &str {
+        &self.base_skill_hash
+    }
+
+    pub fn session_count(&self) -> usize {
+        self.session_count
+    }
+
+    pub fn task_count(&self) -> usize {
+        self.task_count
+    }
+
+    pub fn notes(&self) -> &[String] {
+        &self.notes
+    }
+}
+
+#[derive(Debug)]
+struct RefreshResult {
+    session_count: usize,
+    task_count: usize,
+    notes: Vec<String>,
+    tasks_file: TasksFile,
+    task_store_bytes: Vec<u8>,
+}
+
+fn refresh_tasks_with_state_saver<F>(cfg: &GymConfig, state_saver: F) -> Result<RefreshResult>
 where
-    F: FnOnce(&std::path::Path, &crate::state::GymState) -> Result<()>,
+    F: FnOnce(&Path, &crate::state::GymState) -> Result<()>,
 {
     ensure_private_dir(&cfg.gym_dir())?;
     let sessions = harvest_sessions(
@@ -66,6 +173,8 @@ where
         .filter(|task| task.status == ReviewStatus::Approved && approved_ids.contains(&task.id))
         .count();
     let task_count = tasks_file.tasks.len();
+    let task_store_bytes = serde_json::to_vec_pretty(&tasks_file)
+        .with_context(|| format!("serialize refreshed task store {}", cfg.tasks_path().display()))?;
     save_tasks(&cfg.tasks_path(), &tasks_file)?;
 
     state.last_harvest_at = Some(now);
@@ -93,6 +202,26 @@ where
     if let Some(warning) = state_save_warning {
         notes.push(warning);
     }
+    Ok(RefreshResult {
+        session_count: sessions.len(),
+        task_count,
+        notes,
+        tasks_file,
+        task_store_bytes,
+    })
+}
+
+/// Harvest + mine + merge into tasks.json without changing review decisions.
+pub fn dry_run(cfg: &GymConfig) -> Result<GymReport> {
+    dry_run_with_state_saver(cfg, save_state)
+}
+
+fn dry_run_with_state_saver<F>(cfg: &GymConfig, state_saver: F) -> Result<GymReport>
+where
+    F: FnOnce(&Path, &crate::state::GymState) -> Result<()>,
+{
+    let refresh = refresh_tasks_with_state_saver(cfg, state_saver)?;
+    let mut notes = refresh.notes;
     if cfg.backend != "mock" {
         notes.push(format!(
             "backend={} requested; v0.1 dry-run stays offline (mock harvest/mine only).",
@@ -107,14 +236,65 @@ where
     }
 
     Ok(GymReport {
-        sessions: sessions.len(),
-        tasks: task_count,
+        sessions: refresh.session_count,
+        tasks: refresh.task_count,
         backend: cfg.backend.clone(),
         staged: false,
         proposal_id: None,
         target_skill: cfg.target_skill.clone(),
         notes,
         gym_dir: cfg.gym_dir(),
+    })
+}
+
+/// Acquires the exclusive run lease and prepares every model-free run input.
+///
+/// Configuration and the target skill are validated before harvesting. The
+/// refreshed task store is then loaded and validated, approved tasks are
+/// deterministically split, and hashes are computed from the exact raw bytes
+/// that future run persistence must reference. No run or proposal artifacts
+/// are created and no model boundary is crossed.
+pub fn prepare_run(cfg: &GymConfig) -> Result<PreparedRun> {
+    let lease = RunLease::acquire(cfg)?;
+    let target_skill = cfg.validate_for_run()?;
+    let base_bytes = std::fs::read(&target_skill)
+        .with_context(|| format!("read complete target skill {}", target_skill.display()))?;
+    let base_skill_hash = format!("{:x}", Sha256::digest(&base_bytes));
+    let base_skill = String::from_utf8(base_bytes)
+        .with_context(|| format!("target skill is not UTF-8: {}", target_skill.display()))?;
+
+    let RefreshResult {
+        session_count,
+        task_count,
+        notes,
+        tasks_file,
+        task_store_bytes,
+    } = refresh_tasks_with_state_saver(cfg, save_state)?;
+    let task_store_hash = format!("{:x}", Sha256::digest(&task_store_bytes));
+
+    let mut approved_tasks = validate_reviewed_tasks(&tasks_file)?
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    approved_tasks.sort_by(|left, right| left.id.cmp(&right.id));
+    let approved_refs = approved_tasks.iter().collect::<Vec<_>>();
+    let split = split_tasks(
+        &approved_refs,
+        cfg.validation_ratio,
+        cfg.min_validation_tasks,
+    )?;
+
+    Ok(PreparedRun {
+        _lease: lease,
+        approved_tasks,
+        split,
+        target_skill,
+        base_skill,
+        task_store_hash,
+        base_skill_hash,
+        session_count,
+        task_count,
+        notes,
     })
 }
 
@@ -228,9 +408,14 @@ pub fn adopt(cfg: &GymConfig) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{CheckSpec, ReviewStatus, TasksFile};
+    use crate::types::{
+        CheckSpec, MinedTask, ReviewStatus, TaskSplit, TasksFile, SCHEMA_VERSION,
+    };
+    use chrono::Utc;
+    use sha2::{Digest, Sha256};
+    use std::collections::BTreeMap;
     use std::time::{SystemTime, UNIX_EPOCH};
-    use tempfile::tempdir;
+    use tempfile::{tempdir, TempDir};
 
     fn unique_test_dir(name: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -533,5 +718,323 @@ mod tests {
         assert!(!config.proposal_dir().join("LATEST").exists());
 
         std::fs::remove_dir_all(root).ok();
+    }
+
+    struct PreflightFixture {
+        _root: TempDir,
+        config: GymConfig,
+    }
+
+    fn preflight_task(id: &str, status: ReviewStatus, checks: Vec<CheckSpec>) -> MinedTask {
+        let now = Utc::now();
+        MinedTask {
+            id: id.to_owned(),
+            title: format!("Task {id}"),
+            prompt: format!("Complete task {id}"),
+            source_session_ids: vec![format!("session-{id}")],
+            source_occurrences: BTreeMap::from([(format!("session-{id}"), 1)]),
+            frequency: 1,
+            status,
+            checks,
+            rubric: None,
+            review_note: None,
+            reviewed_at: Some(now),
+            first_seen_at: now,
+            last_seen_at: now,
+        }
+    }
+
+    fn valid_check(id: &str) -> CheckSpec {
+        CheckSpec::Contains {
+            value: format!("done-{id}"),
+            case_sensitive: true,
+        }
+    }
+
+    fn preflight_fixture(statuses: &[ReviewStatus]) -> PreflightFixture {
+        let root = tempdir().expect("create temporary directory");
+        let project = root.path().join("project");
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&project).expect("create project");
+        std::fs::create_dir_all(&sessions).expect("create sessions");
+        let target = project.join("skills/demo/SKILL.md");
+        std::fs::create_dir_all(target.parent().expect("target parent")).expect("create skills");
+        std::fs::write(&target, b"---\nname: demo\n---\n\nComplete the task.\n")
+            .expect("write base skill");
+
+        let mut config = GymConfig::for_project(&project).expect("build config");
+        config.sessions_root = sessions;
+        config.lookback_hours = 0;
+        config.target_skill = Some(PathBuf::from("skills/demo/SKILL.md"));
+        let tasks = statuses
+            .iter()
+            .enumerate()
+            .rev()
+            .map(|(index, status)| {
+                let id = format!("task-{index}");
+                let checks = if *status == ReviewStatus::Approved {
+                    vec![valid_check(&id)]
+                } else {
+                    Vec::new()
+                };
+                preflight_task(&id, status.clone(), checks)
+            })
+            .collect();
+        crate::task_store::save_tasks(
+            &config.tasks_path(),
+            &TasksFile {
+                schema_version: SCHEMA_VERSION,
+                generated_at: Utc::now(),
+                project: project.canonicalize().expect("canonical project"),
+                tasks,
+            },
+        )
+        .expect("save tasks");
+
+        PreflightFixture {
+            _root: root,
+            config,
+        }
+    }
+
+    fn five_approved_fixture() -> PreflightFixture {
+        preflight_fixture(&[
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+        ])
+    }
+
+    #[test]
+    fn prepared_run_holds_exclusive_lock_and_releases_it_on_drop() {
+        let fixture = five_approved_fixture();
+        let first = prepare_run(&fixture.config).expect("first preflight");
+
+        let conflict = prepare_run(&fixture.config)
+            .expect_err("held lease must prevent a concurrent preflight")
+            .to_string();
+        assert!(conflict.contains("already in progress"), "{conflict}");
+
+        drop(first);
+        prepare_run(&fixture.config).expect("lock should release when prepared run drops");
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(fixture.config.run_lock_path())
+                    .expect("lock metadata")
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_config_and_target_fail_before_harvest_mutates_tasks() {
+        for defect in ["config", "target"] {
+            let mut fixture = five_approved_fixture();
+            let before = std::fs::read(fixture.config.tasks_path()).expect("read tasks before");
+            write_session(
+                &fixture.config.sessions_root.join("new.jsonl"),
+                "new-session",
+                &fixture.config.project,
+                "Document a newly harvested deployment rollback procedure",
+            );
+            if defect == "config" {
+                fixture.config.validation_ratio = 1.0;
+            } else {
+                fixture.config.target_skill = Some(PathBuf::from("skills/missing/SKILL.md"));
+            }
+
+            prepare_run(&fixture.config).expect_err("invalid preflight must fail");
+
+            assert_eq!(
+                std::fs::read(fixture.config.tasks_path()).expect("read unchanged tasks"),
+                before,
+                "{defect} defect mutated task store"
+            );
+            assert!(!fixture.config.state_path().exists());
+        }
+    }
+
+    #[test]
+    fn refresh_is_preserved_before_approved_selection_rejects_small_suite() {
+        let fixture = preflight_fixture(&[
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+        ]);
+        write_session(
+            &fixture.config.sessions_root.join("new.jsonl"),
+            "new-session",
+            &fixture.config.project,
+            "Document a newly harvested deployment rollback procedure",
+        );
+
+        let error = prepare_run(&fixture.config)
+            .expect_err("new pending task must not satisfy approved minimum")
+            .to_string();
+        let tasks = load_tasks(
+            &fixture.config.tasks_path(),
+            &fixture.config.project,
+        )
+        .expect("load refreshed tasks");
+
+        assert!(error.contains("at least 5 approved tasks"), "{error}");
+        assert_eq!(tasks.tasks.len(), 5);
+        assert_eq!(
+            tasks
+                .tasks
+                .iter()
+                .filter(|task| task.status == ReviewStatus::Approved)
+                .count(),
+            4
+        );
+        assert!(tasks
+            .tasks
+            .iter()
+            .any(|task| task.source_session_ids == ["new-session"]));
+        assert!(fixture.config.state_path().exists());
+    }
+
+    #[test]
+    fn pending_and_rejected_tasks_are_excluded_from_stable_prepared_inputs() {
+        let fixture = preflight_fixture(&[
+            ReviewStatus::Rejected,
+            ReviewStatus::Approved,
+            ReviewStatus::Pending,
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+            ReviewStatus::Approved,
+        ]);
+
+        let prepared = prepare_run(&fixture.config).expect("prepare approved task suite");
+        let ids = prepared
+            .approved_tasks()
+            .iter()
+            .map(|task| task.id.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(ids, ["task-1", "task-3", "task-4", "task-5", "task-6"]);
+        assert_eq!(prepared.task_count(), 7);
+        assert_eq!(prepared.approved_task_count(), 5);
+        assert_eq!(prepared.split().train_ids.len(), 3);
+        assert_eq!(prepared.split().validation_ids.len(), 2);
+        assert_eq!(
+            prepared.split().train_ids.len() + prepared.split().validation_ids.len(),
+            5
+        );
+    }
+
+    #[test]
+    fn approved_tasks_require_nonempty_valid_checks() {
+        for checks in [
+            Vec::new(),
+            vec![CheckSpec::Regex {
+                pattern: "(".into(),
+            }],
+        ] {
+            let fixture = five_approved_fixture();
+            let mut tasks =
+                load_tasks(&fixture.config.tasks_path(), &fixture.config.project).unwrap();
+            tasks.tasks[0].checks = checks;
+            crate::task_store::save_tasks(&fixture.config.tasks_path(), &tasks).unwrap();
+
+            let error = prepare_run(&fixture.config)
+                .expect_err("invalid approved checks must fail preflight")
+                .to_string();
+            assert!(error.contains("invalid checks"), "{error}");
+        }
+    }
+
+    #[test]
+    fn prepared_run_uses_raw_hashes_complete_base_and_canonical_target() {
+        let fixture = five_approved_fixture();
+        let target = fixture
+            .config
+            .project
+            .join("skills/demo/SKILL.md")
+            .canonicalize()
+            .expect("canonical target");
+        let expected_base = std::fs::read(&target).expect("read raw base");
+        let prepared = prepare_run(&fixture.config).expect("prepare run");
+        let expected_tasks =
+            std::fs::read(fixture.config.tasks_path()).expect("read raw refreshed tasks");
+
+        assert_eq!(prepared.target_skill(), target);
+        assert_eq!(prepared.base_skill().as_bytes(), expected_base);
+        assert_eq!(
+            prepared.base_skill_hash(),
+            format!("{:x}", Sha256::digest(&expected_base))
+        );
+        assert_eq!(
+            prepared.task_store_hash(),
+            format!("{:x}", Sha256::digest(&expected_tasks))
+        );
+        assert_eq!(prepared.session_count(), 0);
+        assert!(!prepared.notes().is_empty());
+    }
+
+    #[test]
+    fn corrupt_or_missing_task_store_fails_without_run_artifacts() {
+        let corrupt = five_approved_fixture();
+        std::fs::write(corrupt.config.tasks_path(), b"{corrupt").expect("corrupt tasks");
+        let corrupt_error = prepare_run(&corrupt.config)
+            .expect_err("corrupt tasks must fail")
+            .to_string();
+        assert!(corrupt_error.contains("parse tasks JSON"), "{corrupt_error}");
+        assert!(!corrupt.config.runs_dir().exists());
+        assert!(!corrupt.config.proposal_dir().join("LATEST").exists());
+
+        let missing = five_approved_fixture();
+        std::fs::remove_file(missing.config.tasks_path()).expect("remove tasks");
+        let missing_error = prepare_run(&missing.config)
+            .expect_err("missing reviewed task store must not start a run")
+            .to_string();
+        assert!(
+            missing_error.contains("at least 5 approved tasks"),
+            "{missing_error}"
+        );
+        assert!(!missing.config.runs_dir().exists());
+        assert!(!missing.config.proposal_dir().join("LATEST").exists());
+    }
+
+    #[test]
+    fn successful_preflight_creates_no_run_or_proposal_artifacts() {
+        let fixture = five_approved_fixture();
+
+        let prepared = prepare_run(&fixture.config).expect("prepare run");
+
+        assert_eq!(
+            prepared.split(),
+            &TaskSplit {
+                train_ids: prepared.split().train_ids.clone(),
+                validation_ids: prepared.split().validation_ids.clone(),
+            }
+        );
+        assert!(!fixture.config.runs_dir().exists());
+        assert!(!fixture.config.proposal_dir().exists());
+        assert!(!fixture.config.proposal_dir().join("LATEST").exists());
+    }
+
+    #[test]
+    fn refresh_returns_the_exact_owned_task_store_snapshot_it_persisted() {
+        let fixture = five_approved_fixture();
+
+        let refresh =
+            refresh_tasks_with_state_saver(&fixture.config, save_state).expect("refresh tasks");
+
+        assert_eq!(
+            refresh.task_store_bytes,
+            std::fs::read(fixture.config.tasks_path()).expect("read persisted snapshot")
+        );
+        assert_eq!(refresh.tasks_file.tasks.len(), refresh.task_count);
     }
 }
