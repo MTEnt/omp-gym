@@ -98,8 +98,11 @@ impl GymConfig {
         {
             bail!("minimum score delta must be finite, positive, and at most one");
         }
-        if self.max_output_bytes == 0 || self.max_candidate_bytes == 0 {
-            bail!("output and candidate byte bounds must be greater than zero");
+        if self.max_output_bytes < 2 {
+            bail!("output byte bound must be at least two");
+        }
+        if self.max_candidate_bytes == 0 {
+            bail!("candidate byte bound must be greater than zero");
         }
         if !self.max_growth_ratio.is_finite() || self.max_growth_ratio < 1.0 {
             bail!("maximum growth ratio must be finite and at least one");
@@ -256,6 +259,13 @@ mod tests {
         config.min_score_delta = 0.05;
         config.max_growth_ratio = 0.5;
         assert!(config.validate_for_run().unwrap_err().to_string().contains("growth ratio"));
+        config.max_growth_ratio = 1.5;
+        config.max_output_bytes = 1;
+        assert!(config
+            .validate_for_run()
+            .unwrap_err()
+            .to_string()
+            .contains("output"));
     }
 
     #[test]

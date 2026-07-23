@@ -5,6 +5,10 @@ use std::sync::LazyLock;
 static REDACTIONS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
     [
         (
+            r"(?i)(authorization\s*:\s*)?bearer\s+\S+",
+            "${1}Bearer [REDACTED]",
+        ),
+        (
             r"(?i)(api[_-]?key|token|secret|password)\s*[:=]\s*\S+",
             "$1=[REDACTED]",
         ),
@@ -13,10 +17,6 @@ static REDACTIONS: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         (
             r"(?i)[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}",
             "[EMAIL]",
-        ),
-        (
-            r"(?i)(authorization\s*:\s*)?bearer\s+\S+",
-            "${1}Bearer [REDACTED]",
         ),
         (
             r"(?s)-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----",
@@ -82,6 +82,12 @@ mod tests {
         assert!(!redacted.contains("TOP-SECRET-KEY-MATERIAL"));
         assert!(redacted.contains("[REDACTED]"));
         assert!(redacted.contains("[EMAIL]"));
+    }
+
+    #[test]
+    fn bearer_credential_after_token_label_is_fully_redacted() {
+        let redacted = redact_text("token: Bearer compound-secret-credential");
+        assert!(!redacted.contains("compound-secret-credential"));
     }
 
     #[test]

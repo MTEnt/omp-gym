@@ -46,8 +46,8 @@ impl ModelRunner for OmpRunner {
         if timeout_secs == 0 {
             bail!("model timeout seconds must be greater than zero");
         }
-        if self.config.max_output_bytes == 0 {
-            bail!("maximum output bytes must be greater than zero");
+        if self.config.max_output_bytes < 2 {
+            bail!("maximum output bytes must be at least two");
         }
 
         let workspace = tempfile::tempdir().context("create isolated OMP replay directory")?;
@@ -85,6 +85,7 @@ impl ModelRunner for OmpRunner {
         command
             .arg("--")
             .arg(request.prompt)
+            .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
@@ -165,7 +166,10 @@ impl ModelRunner for OmpRunner {
 
         let (stdout_capture, stdout_error) = join_capture(stdout_thread, "stdout");
         let (stderr_capture, stderr_error) = join_capture(stderr_thread, "stderr");
-        let stdout = String::from_utf8_lossy(&stdout_capture.bytes);
+        let (stdout, stdout_utf8_error) = match std::str::from_utf8(&stdout_capture.bytes) {
+            Ok(stdout) => (stdout, None),
+            Err(_) => ("", Some("OMP stdout was not valid UTF-8".to_owned())),
+        };
         let stderr = sanitize_text_evidence(
             &String::from_utf8_lossy(&stderr_capture.bytes),
             request.prompt,
@@ -179,6 +183,7 @@ impl ModelRunner for OmpRunner {
         errors.extend(wait_error);
         errors.extend(stdout_error);
         errors.extend(stderr_error);
+        errors.extend(stdout_utf8_error);
         if stdout_capture.truncated {
             errors.push(format!("stdout capture truncated at {limit} bytes"));
         }
@@ -651,6 +656,63 @@ printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[],
         assert!(!trajectory.process_success);
         assert_eq!(trajectory.final_text, None);
         assert!(trajectory.error.unwrap().contains("terminal assistant"));
+    }
+
+    #[test]
+    fn invalid_utf8_stdout_is_an_explicit_trajectory_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = root.path().join("omp");
+        write_executable(
+            &fake,
+            "#!/bin/sh\nprintf '{\"type\":\"agent_end\",\"text\":\"'\nprintf '\\377'\nprintf '\"}\\n'\n",
+        );
+
+        let trajectory = OmpRunner::new(config_with_bin(root.path(), fake))
+            .run(&replay_request())
+            .unwrap();
+
+        assert!(!trajectory.process_success);
+        assert_eq!(trajectory.final_text, None);
+        assert!(trajectory.error.unwrap().contains("UTF-8"));
+    }
+
+    #[test]
+    fn explicitly_closes_subprocess_stdin() {
+        let root = tempfile::tempdir().unwrap();
+        let fake = root.path().join("omp");
+        write_executable(
+            &fake,
+            "#!/bin/sh\nif IFS= read -r line; then exit 9; fi\nprintf '%s\\n' '{\"type\":\"message_end\",\"message\":{\"role\":\"assistant\",\"content\":\"ok\",\"stopReason\":\"stop\"}}'\n",
+        );
+        let current_test = std::env::current_exe().unwrap();
+        let mut harness = Command::new(current_test)
+            .args([
+                "--exact",
+                "runner::tests::stdin_null_harness",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OMP_GYM_STDIN_TEST_PROJECT", root.path())
+            .env("OMP_GYM_STDIN_TEST_BIN", &fake)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let _open_stdin = harness.stdin.take().unwrap();
+
+        assert!(harness.wait().unwrap().success());
+    }
+
+    #[test]
+    #[ignore]
+    fn stdin_null_harness() {
+        let project = PathBuf::from(std::env::var_os("OMP_GYM_STDIN_TEST_PROJECT").unwrap());
+        let fake = PathBuf::from(std::env::var_os("OMP_GYM_STDIN_TEST_BIN").unwrap());
+        let trajectory = OmpRunner::new(config_with_bin(&project, fake))
+            .run(&replay_request())
+            .unwrap();
+        assert!(trajectory.process_success, "{:?}", trajectory.error);
     }
 
     #[test]
